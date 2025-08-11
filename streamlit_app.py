@@ -1,37 +1,30 @@
-# streamlit_app.py
 import os, io, re, duckdb, pandas as pd, streamlit as st
 from datetime import datetime
-from google.cloud import storage
 
-# Import your setup helpers
-import rds_agent_setup as setup
+# Import your setup modules
+import rds_agent_setup as rds
+import ec2_ta_setup as ec2
 
-st.set_page_config(page_title="RDS Savings Agent (MVP)", layout="wide")
-st.title("RDS Savings Agent — DuckDB + Streamlit (MVP)")
+st.set_page_config(page_title="Cloud Savings — RDS + EC2 (MVP)", layout="wide")
+st.title("Cloud Savings — RDS + EC2 (MVP)")
 
-# --- Config ---
-# Either use local CSVs from ./data or read from GCS if you set envs
-USE_GCS = st.sidebar.checkbox("Load CSVs from GCS", value=False)
-GCS_BUCKET = st.sidebar.text_input("GCS Bucket", os.getenv("GCS_BUCKET", ""))
-GCS_PREFIX = st.sidebar.text_input("GCS Prefix", os.getenv("GCS_PREFIX", "aws-cost/rds/"))
-
-# Create a DuckDB connection (persist file if you like)
+# Create or reuse a DuckDB connection
 if "con" not in st.session_state:
     st.session_state.con = duckdb.connect(":memory:")
-
 con = st.session_state.con
 
-# --- Helpers to load data ---
+# -------- Helpers ----------
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [re.sub(r"\W+","_", c.strip()).lower() for c in df.columns]
     return df
 
-def load_local_csvs():
-    folder = "data"
-    files = [f for f in os.listdir(folder) if f.endswith(".csv")]
+def load_local_rds_csvs(folder="data"):
+    if not os.path.isdir(folder):
+        os.makedirs(folder, exist_ok=True)
+        return 0
+    files = [f for f in os.listdir(folder) if f.lower().endswith(".csv")]
     if not files:
-        st.warning("No CSVs in ./data. Drop your RDS CSVs there (with headers).")
         return 0
     frames = []
     for f in files:
@@ -40,149 +33,107 @@ def load_local_csvs():
     if not frames:
         return 0
     df_all = pd.concat(frames, ignore_index=True)
-    # Create table if needed
     con.execute("DELETE FROM rds_usage")
     con.register("rds_df", df_all)
     con.execute("INSERT INTO rds_usage SELECT * FROM rds_df")
     con.unregister("rds_df")
     return len(df_all)
 
-def load_gcs_csvs(bucket, prefix):
-    if not bucket:
-        st.error("Please provide a GCS bucket.")
-        return 0
-    client = storage.Client()
-    blobs = [b for b in client.list_blobs(bucket, prefix=prefix) if b.name.endswith(".csv")]
-    if not blobs:
-        st.warning(f"No CSVs found at gs://{bucket}/{prefix}")
-        return 0
+def load_local_ec2_csvs(folder="data_ec2"):
+    return ec2.load_ec2_ta_csvs_from_folder(con, folder=folder)
 
-    frames = []
-    for b in blobs:
-        by = b.download_as_bytes()
-        df = pd.read_csv(io.BytesIO(by))
-        frames.append(normalize_cols(df))
-
-    if not frames:
-        return 0
-    df_all = pd.concat(frames, ignore_index=True)
-    con.execute("DELETE FROM rds_usage")
-    con.register("rds_df", df_all)
-    con.execute("INSERT INTO rds_usage SELECT * FROM rds_df")
-    con.unregister("rds_df")
-    return len(df_all)
-
-# --- One-time table creation (if not created already) ---
-# rds_agent_setup.py already issues CREATE TABLE IF NOT EXISTS; call once:
-if st.sidebar.button("Initialize Tables (once)"):
-    # This runs CREATE TABLEs; no views yet
-    pass  # imported module executed CREATE TABLE on import
-
-# --- Load data controls ---
-colA, colB = st.columns(2)
-with colA:
-    if st.button("🔄 Reload RDS CSVs"):
-        if USE_GCS:
-            n = load_gcs_csvs(GCS_BUCKET, GCS_PREFIX)
-        else:
-            n = load_local_csvs()
-        if n:
-            st.success(f"Loaded {n} rows into rds_usage")
-
-with colB:
-    if st.button("🧱 Build Sizes + Views + (optional) Prices"):
-        setup.initialize_after_loading_usage(con)
-        st.success("Sizes built, views created. Price fetch attempted (if AWS creds).")
-
-st.divider()
-
-# --- Filters (read from DB) ---
-def distinct(col, table="rds_usage"):
+def distinct(col, table):
     try:
-        return [r[0] for r in con.execute(f"SELECT DISTINCT {col} FROM {table} WHERE {col} IS NOT NULL ORDER BY {col}").fetchall()]
+        return [r[0] for r in con.execute(
+            f"SELECT DISTINCT {col} FROM {table} WHERE {col} IS NOT NULL ORDER BY {col}"
+        ).fetchall()]
     except:
         return []
 
-months = con.execute("SELECT DISTINCT billing_period FROM rds_usage ORDER BY billing_period DESC").fetchdf()
-BAs    = distinct("BA", "rds_usage")
-regions= distinct("region", "rds_usage")
+# ---------------- Sidebar actions ----------------
+st.sidebar.header("Data loading")
+colA, colB = st.sidebar.columns(2)
+with colA:
+    if st.button("Reload RDS CSVs"):
+        n = load_local_rds_csvs("data")
+        st.success(f"RDS: loaded {n} rows" if n else "RDS: no CSVs found in ./data/")
+with colB:
+    if st.button("Reload EC2 TA CSVs"):
+        n = load_local_ec2_csvs("data_ec2")
+        st.success(f"EC2: loaded {n} rows" if n else "EC2: no CSVs found in ./data_ec2/")
 
-c1, c2, c3 = st.columns(3)
-sel_month = c1.selectbox("Billing period", options=["(all)"] + months["billing_period"].astype(str).tolist())
-sel_ba    = c2.selectbox("Business Unit (BA)", options=["(all)"] + BAs)
-sel_region= c3.selectbox("Region", options=["(all)"] + regions)
+if st.sidebar.button("Build RDS sizes + views (+prices if creds)"):
+    rds.initialize_after_loading_usage(con)
+    st.success("RDS: sizes/views ready (pricing refreshed if AWS creds configured).")
 
-def where_clause(base="1=1"):
+if st.sidebar.button("Build EC2 views"):
+    ec2.create_views_ec2(con)
+    st.success("EC2: TA views created.")
+
+st.sidebar.divider()
+if st.sidebar.button("Refresh AWS prices now (RDS)"):
+    try:
+        rds.refresh_price_rds_from_usage(con, deployment="Single-AZ", engine="Any")
+        st.success("price_rds refreshed.")
+    except Exception as e:
+        st.error(f"Pricing refresh failed (expected if no AWS creds): {e}")
+
+st.divider()
+
+# ---------------- Filters (RDS) ----------------
+st.subheader("RDS — Optimizations")
+rds_months = con.execute("SELECT DISTINCT billing_period FROM rds_usage ORDER BY billing_period DESC").fetchdf()
+rds_BAs    = distinct("BA", "rds_usage")
+rds_regions= distinct("region", "rds_usage")
+
+fc1, fc2, fc3 = st.columns(3)
+rds_sel_month = fc1.selectbox("RDS: Billing period", options=["(all)"] + rds_months["billing_period"].astype(str).tolist())
+rds_sel_ba    = fc2.selectbox("RDS: Business Unit (BA)", options=["(all)"] + rds_BAs)
+rds_sel_region= fc3.selectbox("RDS: Region", options=["(all)"] + rds_regions)
+
+def rds_where(base="1=1"):
     wc = [base]
-    if sel_month != "(all)":
-        wc.append(f"billing_period = DATE '{sel_month}'")
-    if sel_ba != "(all)":
-        wc.append(f"BA = '{sel_ba.replace(\"'\",\"''\")}'")
-    if sel_region != "(all)":
-        wc.append(f"region = '{sel_region.replace(\"'\",\"''\")}'")
+    if rds_sel_month != "(all)":
+        wc.append(f"billing_period = DATE '{rds_sel_month}'")
+    if rds_sel_ba != "(all)":
+        wc.append(f"BA = '{rds_sel_ba.replace(\"'\",\"''\")}'")
+    if rds_sel_region != "(all)":
+        wc.append(f"region = '{rds_sel_region.replace(\"'\",\"''\")}'")
     return " AND ".join(wc)
 
-# --- Summary cards ---
-sum_row = con.execute(f"""
-WITH a AS (
-  SELECT * FROM rds_actions_ranked WHERE {where_clause('1=1')}
-)
-SELECT
-  COUNT(*) AS total_actions,
-  SUM(COALESCE(est_monthly_savings_usd,0)) AS total_savings
-FROM a
-""").fetchdf() if con else pd.DataFrame()
+tabR1, tabR2, tabR3, tabR4 = st.tabs(["Actions (ranked)", "Underutilized", "Rightsize", "High CPU"])
 
-c4, c5 = st.columns(2)
-if not sum_row.empty:
-    c4.metric("Total actions", int(sum_row.loc[0, "total_actions"]))
-    c5.metric("Total est. savings ($/mo)", f"{sum_row.loc[0, 'total_savings']:.2f}")
+with tabR1:
+    q = f"SELECT * FROM rds_actions_ranked WHERE {rds_where('1=1')} ORDER BY est_monthly_savings_usd DESC NULLS LAST, current_cost_usd DESC LIMIT 500"
+    st.caption(q)
+    st.dataframe(con.execute(q).fetchdf())
+    df = con.execute(f"SELECT BA, action, SUM(COALESCE(est_monthly_savings_usd,0)) AS total_savings FROM rds_actions_ranked WHERE {rds_where('1=1')} GROUP BY 1,2 ORDER BY total_savings DESC").fetchdf()
+    st.write("RDS Savings by BA & Action")
+    st.dataframe(df)
 
-# --- Tabs
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Actions (ranked)", "Underutilized", "Rightsize (next smaller)", "Off-hours", "High CPU"
-])
-
-with tab1:
-    q = f"SELECT * FROM rds_actions_ranked WHERE {where_clause('1=1')} ORDER BY est_monthly_savings_usd DESC NULLS LAST, current_cost_usd DESC LIMIT 500"
+with tabR2:
+    q = f"SELECT * FROM rds_underutilized WHERE {rds_where('1=1')} ORDER BY cost_usd DESC LIMIT 500"
     st.caption(q)
     st.dataframe(con.execute(q).fetchdf())
 
-with tab2:
-    q = f"SELECT * FROM rds_underutilized WHERE {where_clause('1=1')} ORDER BY cost_usd DESC LIMIT 500"
-    st.caption(q)
-    st.dataframe(con.execute(q).fetchdf())
-
-with tab3:
+with tabR3:
     q = f"""
     SELECT billing_period, account_name, BA, db_id, region, current_class, recommended_class,
            current_cost_usd, est_monthly_savings_usd, avg_cpu_14d, price_date
     FROM rds_rightsize_next_smaller
-    WHERE {where_clause('1=1')}
+    WHERE {rds_where('1=1')}
     ORDER BY est_monthly_savings_usd DESC NULLS LAST
     LIMIT 500
     """
     st.caption(q)
     st.dataframe(con.execute(q).fetchdf())
 
-with tab4:
-    q = f"""
-    SELECT billing_period, account_name, BA, db_id, region, instance_class, current_cost_usd,
-           est_monthly_savings_usd, approx_247, avg_cpu_14d
-    FROM rds_offhours_candidates
-    WHERE {where_clause('1=1')}
-    ORDER BY est_monthly_savings_usd DESC NULLS LAST
-    LIMIT 500
-    """
-    st.caption(q)
-    st.dataframe(con.execute(q).fetchdf())
-
-with tab5:
+with tabR4:
     q = f"""
     SELECT billing_period, account_name, BA, db_id, region, instance_class,
            hours, cost_usd, avg_cpu_14d, recommendation
     FROM rds_high_utilization
-    WHERE {where_clause('1=1')}
+    WHERE {rds_where('1=1')}
     ORDER BY avg_cpu_14d DESC, cost_usd DESC
     LIMIT 500
     """
@@ -191,17 +142,88 @@ with tab5:
 
 st.divider()
 
-# --- Actions ---
+# ---------------- EC2 TA Section ----------------
+st.subheader("EC2 (Trusted Advisor) — RI Opportunities")
+ec2_BAs     = distinct("BA", "ec2_reserved_recs")
+ec2_regions = distinct("region", "ec2_reserved_recs")
+ec2_plats   = distinct("platform", "ec2_reserved_recs")
+
+e1, e2, e3 = st.columns(3)
+ec2_sel_ba     = e1.selectbox("EC2: Business Unit (BA)", options=["(all)"] + ec2_BAs)
+ec2_sel_region = e2.selectbox("EC2: Region", options=["(all)"] + ec2_regions)
+ec2_sel_plat   = e3.selectbox("EC2: Platform", options=["(all)"] + ec2_plats)
+
+def ec2_where(base="1=1"):
+    wc = [base]
+    if ec2_sel_ba != "(all)":
+        wc.append(f"BA = '{ec2_sel_ba.replace(\"'\",\"''\")}'")
+    if ec2_sel_region != "(all)":
+        wc.append(f"region = '{ec2_sel_region.replace(\"'\",\"''\")}'")
+    if ec2_sel_plat != "(all)":
+        wc.append(f"platform = '{ec2_sel_plat.replace(\"'\",\"''\")}'")
+    return " AND ".join(wc)
+
+tabE1, tabE2, tabE3, tabE4, tabE5 = st.tabs([
+    "Ranked (ROI + Risk)", "By BA (coverage%)", "By Platform", "By Region", "Pareto Top"
+])
+
+with tabE1:
+    q = f"""
+    SELECT *
+    FROM ec2_ri_ranked
+    WHERE {ec2_where('1=1')}
+    ORDER BY savings_per_instance DESC NULLS LAST, est_monthly_savings_usd DESC NULLS LAST
+    LIMIT 500
+    """
+    st.caption(q)
+    st.dataframe(con.execute(q).fetchdf())
+    # Quick filters users often ask for:
+    st.markdown("**Quick filters:**")
+    colq1, colq2 = st.columns(2)
+    if colq1.button("High-Util ≥ 80% & ≤ 2 instances suggested"):
+        q2 = f"""
+        SELECT *
+        FROM ec2_ri_ranked
+        WHERE {ec2_where("1=1")} AND avg_util_6m >= 80 AND num_instances_to_purchase <= 2
+        ORDER BY est_monthly_savings_usd DESC NULLS LAST
+        LIMIT 200
+        """
+        st.caption(q2); st.dataframe(con.execute(q2).fetchdf())
+    if colq2.button("Purchase candidates (util ≥50% & $/inst ≥25)"):
+        q3 = f"""
+        SELECT *
+        FROM ec2_ri_ranked
+        WHERE {ec2_where("1=1")} AND avg_util_6m >= 50 AND savings_per_instance >= 25
+        ORDER BY savings_per_instance DESC NULLS LAST
+        LIMIT 200
+        """
+        st.caption(q3); st.dataframe(con.execute(q3).fetchdf())
+
+with tabE2:
+    q = f"SELECT * FROM ec2_ri_by_ba WHERE {ec2_where('1=1')} ORDER BY total_savings_usd DESC"
+    st.caption(q); st.dataframe(con.execute(q).fetchdf())
+
+with tabE3:
+    q = f"SELECT * FROM ec2_ri_by_platform WHERE {ec2_where('1=1')} ORDER BY total_savings_usd DESC NULLS LAST"
+    st.caption(q); st.dataframe(con.execute(q).fetchdf())
+
+with tabE4:
+    q = f"SELECT * FROM ec2_ri_by_region WHERE {ec2_where('1=1')} ORDER BY total_savings_usd DESC NULLS LAST"
+    st.caption(q); st.dataframe(con.execute(q).fetchdf())
+
+with tabE5:
+    q = f"SELECT * FROM ec2_ri_top_pareto WHERE {ec2_where('1=1')} ORDER BY est_monthly_savings_usd DESC NULLS LAST"
+    st.caption(q); st.dataframe(con.execute(q).fetchdf())
+
+st.divider()
+
+# Downloads
 c6, c7 = st.columns(2)
 with c6:
-    if st.button("↻ Refresh Prices (AWS Pricing API)"):
-        try:
-            setup.refresh_price_rds_from_usage(con, deployment="Single-AZ", engine="Any")
-            st.success("price_rds refreshed.")
-        except Exception as e:
-            st.error(f"Pricing refresh failed (expected if no AWS creds): {e}")
-
+    if st.button("⬇️ Download RDS Actions"):
+        df = con.execute(f"SELECT * FROM rds_actions_ranked WHERE {rds_where('1=1')}").fetchdf()
+        st.download_button("rds_actions_ranked.csv", data=df.to_csv(index=False), file_name="rds_actions_ranked.csv", mime="text/csv")
 with c7:
-    if st.button("⬇️ Export Actions CSV"):
-        df = con.execute(f"SELECT * FROM rds_actions_ranked WHERE {where_clause('1=1')}").fetchdf()
-        st.download_button("Download rds_actions_ranked.csv", data=df.to_csv(index=False), file_name="rds_actions_ranked.csv", mime="text/csv")
+    if st.button("⬇️ Download EC2 Ranked"):
+        df = con.execute(f"SELECT * FROM ec2_ri_ranked WHERE {ec2_where('1=1')}").fetchdf()
+        st.download_button("ec2_ri_ranked.csv", data=df.to_csv(index=False), file_name="ec2_ri_ranked.csv", mime="text/csv")
