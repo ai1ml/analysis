@@ -4,6 +4,7 @@ from datetime import datetime
 # Import your setup modules
 import rds_agent_setup as rds
 import ec2_ta_setup as ec2
+import snapshots_setup as snaps
 
 st.set_page_config(page_title="Cloud Savings — RDS + EC2 (MVP)", layout="wide")
 st.title("Cloud Savings — RDS + EC2 (MVP)")
@@ -79,6 +80,17 @@ if st.sidebar.button("Refresh AWS prices now (RDS)"):
         st.error(f"Pricing refresh failed (expected if no AWS creds): {e}")
 
 st.divider()
+
+st.sidebar.subheader("Snapshots")
+colS1, colS2 = st.sidebar.columns(2)
+with colS1:
+    if st.button("Reload Snapshot CSVs"):
+        n = snaps.load_snapshots_csvs_from_folder(con, folder="data_snapshots")
+        st.success(f"Snapshots: loaded {n} rows" if n else "Snapshots: no CSVs in ./data_snapshots/")
+with colS2:
+    if st.button("Build Snapshot views"):
+        snaps.initialize(con)
+        st.success("Snapshots: views created.")
 
 # ---------------- Filters (RDS) ----------------
 st.subheader("RDS — Optimizations")
@@ -227,3 +239,69 @@ with c7:
     if st.button("⬇️ Download EC2 Ranked"):
         df = con.execute(f"SELECT * FROM ec2_ri_ranked WHERE {ec2_where('1=1')}").fetchdf()
         st.download_button("ec2_ri_ranked.csv", data=df.to_csv(index=False), file_name="ec2_ri_ranked.csv", mime="text/csv")
+
+
+st.divider()
+st.subheader("Snapshots — Cost & Cleanup Opportunities")
+
+# Filters
+snap_BAs     = [r[0] for r in con.execute("SELECT DISTINCT business_area FROM snapshots_parsed ORDER BY 1").fetchall()] if con else []
+snap_regions = [r[0] for r in con.execute("SELECT DISTINCT region FROM snapshots_parsed ORDER BY 1").fetchall()] if con else []
+snap_types   = [r[0] for r in con.execute("SELECT DISTINCT snapshot_type FROM snapshots_parsed ORDER BY 1").fetchall()] if con else []
+
+s1, s2, s3 = st.columns(3)
+snap_sel_ba    = s1.selectbox("Business Area", options=["(all)"] + snap_BAs)
+snap_sel_region= s2.selectbox("Region", options=["(all)"] + snap_regions)
+snap_sel_type  = s3.selectbox("Snapshot Type", options=["(all)"] + snap_types)
+
+def sw(base="1=1"):
+    wc = [base]
+    if snap_sel_ba != "(all)":
+        wc.append(f"business_area = '{snap_sel_ba.replace(\"'\",\"''\")}'")
+    if snap_sel_region != "(all)":
+        wc.append(f"region = '{snap_sel_region.replace(\"'\",\"''\")}'")
+    if snap_sel_type != "(all)":
+        wc.append(f"snapshot_type = '{snap_sel_type.replace(\"'\",\"''\")}'")
+    return " AND ".join(wc)
+
+tabS1, tabS2, tabS3, tabS4, tabS5 = st.tabs([
+    "Hotspots (BA/Region/Type)", "Archive Opportunity", "Sprawl — Top", "Sprawl — Clusters", "BA Roll-up"
+])
+
+with tabS1:
+    q = f"SELECT * FROM snapshots_by_ba_region WHERE {sw('1=1')} ORDER BY total_cost_usd DESC LIMIT 500"
+    st.caption(q)
+    st.dataframe(con.execute(q).fetchdf())
+
+with tabS2:
+    q = f"""
+    SELECT business_area, region, snapshot_id, gb_standard, cost_standard,
+           price_snapshot_gb, price_archive_gb, est_monthly_savings_usd
+    FROM snapshots_archive_opportunity
+    WHERE {sw('1=1')}
+    ORDER BY est_monthly_savings_usd DESC NULLS LAST, gb_standard DESC
+    LIMIT 500
+    """
+    st.caption(q)
+    st.dataframe(con.execute(q).fetchdf())
+
+with tabS3:
+    q = f"SELECT * FROM snapshots_sprawl_top WHERE {sw('1=1')} ORDER BY public_cost_usd DESC LIMIT 500"
+    st.caption(q)
+    st.dataframe(con.execute(q).fetchdf())
+
+with tabS4:
+    # clusters ignore snapshot_type filter by design; apply BA/region only
+    q = f"""
+    SELECT * FROM snapshots_sprawl_clusters
+    WHERE {sw('1=1').replace(" AND snapshot_type = ", " AND 1=1 /*type ignored*/ AND ")}
+    ORDER BY snapshot_count DESC, total_cost_usd DESC
+    LIMIT 200
+    """
+    st.caption(q)
+    st.dataframe(con.execute(q).fetchdf())
+
+with tabS5:
+    q = f"SELECT * FROM snapshots_by_ba WHERE {sw('1=1').replace(' AND snapshot_type = ', ' AND 1=1 /*type ignored*/ AND ')} ORDER BY total_cost_usd DESC"
+    st.caption(q)
+    st.dataframe(con.execute(q).fetchdf())
