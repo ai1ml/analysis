@@ -1,0 +1,23 @@
+WITH snapshot_avg AS (
+    SELECT 
+        snapshot_type,
+        AVG(avg_cost_per_gb) AS global_avg
+    FROM snap_price_per_gb
+    WHERE snapshot_type IN ('Snapshot', 'Snapshot_Archive')
+    GROUP BY snapshot_type
+)
+SELECT
+    p1.region,
+    COALESCE(
+        p1.avg_cost_per_gb, 
+        (SELECT global_avg FROM snapshot_avg WHERE snapshot_type = 'Snapshot')
+    ) AS price_snapshot_gb,
+    COALESCE(
+        p2.avg_cost_per_gb, 
+        (SELECT global_avg FROM snapshot_avg WHERE snapshot_type = 'Snapshot_Archive')
+    ) AS price_archive_gb
+FROM snap_price_per_gb p1
+LEFT JOIN snap_price_per_gb p2
+    ON p1.region = p2.region
+    AND p2.snapshot_type = 'Snapshot_Archive'
+WHERE p1.snapshot_type = 'Snapshot';
