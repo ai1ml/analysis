@@ -16,7 +16,15 @@ if "con" not in st.session_state:
     st.session_state.con = duckdb.connect(":memory:")
 con = st.session_state.con
 
+
 # -------- Helpers ----------
+def sw_for_view(view_name, base="1=1"):
+    # discover columns of the view
+    cols = set(con.execute(f"SELECT * FROM {view_name} LIMIT 0").fetchdf().columns)
+    include_type = "snapshot_type" in cols
+    # build WHERE using Option A’s function
+    return sw(base=base, include_type=include_type)
+
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [re.sub(r"\W+","_", c.strip()).lower() for c in df.columns]
