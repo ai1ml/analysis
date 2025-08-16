@@ -323,3 +323,28 @@ if __name__ == "__main__":
     # n = load_ta_csv(con, "ec2_ta.csv"); print("rows:", n)
     # create_views(con)
     # print(con.execute("SELECT * FROM ec2_ta_actions_explain LIMIT 5").fetchdf())
+
+
+tab1, tab2, tab3, tab4 = st.tabs(["Hotspots", "Recs", "Actions", "Spot/Schedule"])
+
+with tab1:  # BA×Region×Platform rollup
+    v = "ec2_ta_by_ba_region_platform"
+    q = f"SELECT * FROM {v} WHERE {sw_for_view(v)} ORDER BY total_savings_all DESC LIMIT 500"
+    st.caption(q); st.dataframe(con.execute(q).fetchdf())
+
+with tab2:  # Detailed TA recs
+    v = "ec2_ta_recommendations_detail"
+    q = f"SELECT * FROM {v} WHERE {sw_for_view(v)} ORDER BY COALESCE(ta_est_savings,0)+COALESCE(ta_rightsize_savings,0) DESC NULLS LAST LIMIT 500"
+    st.caption(q); st.dataframe(con.execute(q).fetchdf())
+
+with tab3:  # Unified actions (ranked & explained)
+    v = "ec2_ta_actions_explain"
+    q = f"SELECT * FROM {v} WHERE {sw_for_view(v)} ORDER BY best_action_savings DESC NULLS LAST LIMIT 500"
+    st.caption(q); st.dataframe(con.execute(q).fetchdf())
+
+with tab4:  # Optional: Spot & Scheduling candidates
+    v1, v2 = "ec2_ta_spot_candidates", "ec2_ta_scheduling_candidates"
+    q1 = f"SELECT * FROM {v1} WHERE {sw_for_view(v1)} ORDER BY est_spot_savings DESC NULLS LAST LIMIT 500"
+    q2 = f"SELECT * FROM {v2} WHERE {sw_for_view(v2)} ORDER BY est_sched_savings DESC NULLS LAST LIMIT 500"
+    st.caption(q1); st.dataframe(con.execute(q1).fetchdf())
+    st.caption(q2); st.dataframe(con.execute(q2).fetchdf())
