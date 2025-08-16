@@ -1,23 +1,110 @@
-WITH snapshot_avg AS (
-    SELECT 
-        snapshot_type,
-        AVG(avg_cost_per_gb) AS global_avg
-    FROM snap_price_per_gb
-    WHERE snapshot_type IN ('Snapshot', 'Snapshot_Archive')
-    GROUP BY snapshot_type
-)
-SELECT
-    p1.region,
-    COALESCE(
-        p1.avg_cost_per_gb, 
-        (SELECT global_avg FROM snapshot_avg WHERE snapshot_type = 'Snapshot')
-    ) AS price_snapshot_gb,
-    COALESCE(
-        p2.avg_cost_per_gb, 
-        (SELECT global_avg FROM snapshot_avg WHERE snapshot_type = 'Snapshot_Archive')
-    ) AS price_archive_gb
-FROM snap_price_per_gb p1
-LEFT JOIN snap_price_per_gb p2
-    ON p1.region = p2.region
-    AND p2.snapshot_type = 'Snapshot_Archive'
-WHERE p1.snapshot_type = 'Snapshot';
+# =========================
+# EC2 Trusted Advisor (RI)
+# =========================
+
+st.markdown("## EC2 Trusted Advisor (RI)")
+
+# ---- helpers (match your style) ----
+def _distinct(col, src="ec2_ta_norm"):
+    try:
+        rows = con.execute(f"SELECT DISTINCT {col} FROM {src} WHERE {col} IS NOT NULL ORDER BY 1").fetchall()
+        return [r[0] for r in rows if r[0] is not None]
+    except Exception:
+        return []
+
+def sw_for_view(view_name, base="1=1"):
+    cols = set(con.execute(f"SELECT * FROM {view_name} LIMIT 0").fetchdf().columns)
+    wc = [base]
+    # use the same selection variables you already use elsewhere, or define here:
+    # ta_sel_date, ta_sel_ba, ta_sel_region, ta_sel_family, ta_sel_flavor
+    if "recommendation_date" in cols and ta_sel_date   != "(all)":
+        wc.append(f"recommendation_date = '{ta_sel_date.replace(\"'\",\"''\")}'")
+    if "business_area"       in cols and ta_sel_ba     != "(all)":
+        wc.append(f"business_area = '{ta_sel_ba.replace(\"'\",\"''\")}'")
+    if "region"              in cols and ta_sel_region != "(all)":
+        wc.append(f"region = '{ta_sel_region.replace(\"'\",\"''\")}'")
+    # views use "platform" for family rollups, "platform_flavor" for detailed variants
+    if "platform"            in cols and ta_sel_family != "(all)":
+        wc.append(f"platform = '{ta_sel_family.replace(\"'\",\"''\")}'")
+    if "platform_flavor"     in cols and ta_sel_flavor != "(all)":
+        wc.append(f"platform_flavor = '{ta_sel_flavor.replace(\"'\",\"''\")}'")
+    return " AND ".join(wc)
+
+# ---- filters row (compact, like your snapshots section) ----
+ta_dates    = ["(all)"] + _distinct("recommendation_date")
+ta_bas      = ["(all)"] + _distinct("business_area")
+ta_regions  = ["(all)"] + _distinct("region")
+ta_families = ["(all)"] + _distinct("platform_family")
+ta_flavors  = ["(all)"] + _distinct("platform_flavor")
+
+c1, c2, c3, c4, c5 = st.columns(5)
+with c1: ta_sel_date   = st.selectbox("Recommendation date", ta_dates,    key="ta_date")
+with c2: ta_sel_ba     = st.selectbox("Business Area",       ta_bas,      key="ta_ba")
+with c3: ta_sel_region = st.selectbox("Region",              ta_regions,  key="ta_region")
+with c4: ta_sel_family = st.selectbox("Platform (family)",   ta_families, key="ta_family")
+with c5: ta_sel_flavor = st.selectbox("Platform flavor",     ta_flavors,  key="ta_flavor")
+
+# ---- tabs (matching your naming style) ----
+tabT1, tabT2, tabT3, tabT4, tabT5 = st.tabs([
+    "Hotspots", "Rollup (Family)", "Rollup (Flavor)", "Recommendations", "Actions"
+])
+
+with tabT1:
+    v = "ec2_ta_hotspots"
+    q = f"""
+    SELECT *
+    FROM {v}
+    WHERE {sw_for_view(v)}
+    ORDER BY total_savings_usd DESC NULLS LAST
+    LIMIT 500
+    """
+    st.caption(q.strip())
+    st.dataframe(con.execute(q).fetchdf())
+
+with tabT2:
+    v = "ec2_ta_by_ba_region_platform"
+    q = f"""
+    SELECT *
+    FROM {v}
+    WHERE {sw_for_view(v)}
+    ORDER BY total_ta_savings_usd DESC NULLS LAST, rec_instances DESC NULLS LAST
+    LIMIT 500
+    """
+    st.caption(q.strip())
+    st.dataframe(con.execute(q).fetchdf())
+
+with tabT3:
+    v = "ec2_ta_by_ba_region_flavor"
+    q = f"""
+    SELECT *
+    FROM {v}
+    WHERE {sw_for_view(v)}
+    ORDER BY total_ta_savings_usd DESC NULLS LAST, rec_instances DESC NULLS LAST
+    LIMIT 500
+    """
+    st.caption(q.strip())
+    st.dataframe(con.execute(q).fetchdf())
+
+with tabT4:
+    v = "ec2_ta_recommendations_detail"
+    q = f"""
+    SELECT *
+    FROM {v}
+    WHERE {sw_for_view(v)}
+    ORDER BY ta_est_savings_usd DESC NULLS LAST
+    LIMIT 500
+    """
+    st.caption(q.strip())
+    st.dataframe(con.execute(q).fetchdf())
+
+with tabT5:
+    v = "ec2_ta_actions_explain"
+    q = f"""
+    SELECT *
+    FROM {v}
+    WHERE {sw_for_view(v)}
+    ORDER BY best_action_savings DESC NULLS LAST
+    LIMIT 500
+    """
+    st.caption(q.strip())
+    st.dataframe(con.execute(q).fetchdf())
