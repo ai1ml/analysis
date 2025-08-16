@@ -65,7 +65,7 @@ def load_ta_csv(con: duckdb.DuckDBPyConnection, csv_path: str) -> int:
 # -----------------------------
 def create_views(con: duckdb.DuckDBPyConnection):
 
-    # Normalize platform label once
+    # Normalize platform once
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_norm AS
     SELECT
@@ -78,36 +78,39 @@ def create_views(con: duckdb.DuckDBPyConnection):
     FROM ec2_ta;
     """)
 
-    # Rollup: BA × Region × Platform
+    # Rollup: BA × Region × Platform (keyed by recommendation_date)
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_by_ba_region_platform AS
     WITH base AS (
       SELECT
-        billing_period, business_area, region, platform_norm AS platform,
-        SUM(COALESCE(ta_rec_instances,0))                   AS rec_instances,
-        SUM(COALESCE(ta_est_savings_usd,0))                 AS total_ta_savings_usd,
-        AVG(NULLIF(avg_util_6mo_pct,0))                     AS avg_util_6mo_pct
+        recommendation_date, business_area, region, platform_norm AS platform,
+        SUM(COALESCE(ta_rec_instances,0))               AS rec_instances,
+        SUM(COALESCE(ta_est_savings_usd,0))             AS total_ta_savings_usd,
+        AVG(NULLIF(avg_util_6mo_pct,0))                 AS avg_util_6mo_pct
       FROM ec2_ta_norm
       GROUP BY 1,2,3,4
     ),
     tot AS (
-      SELECT billing_period, SUM(total_ta_savings_usd) AS grand_total
+      SELECT recommendation_date, SUM(total_ta_savings_usd) AS grand_total
       FROM base GROUP BY 1
     )
     SELECT
       b.*,
       ROUND(100.0 * b.total_ta_savings_usd / NULLIF(t.grand_total,0), 2) AS savings_share_pct,
-      RANK() OVER (PARTITION BY b.billing_period ORDER BY b.total_ta_savings_usd DESC) AS savings_rank
+      RANK() OVER (
+        PARTITION BY b.recommendation_date
+        ORDER BY b.total_ta_savings_usd DESC
+      ) AS savings_rank
     FROM base b
-    JOIN tot t USING (billing_period)
+    JOIN tot t USING (recommendation_date)
     ORDER BY total_ta_savings_usd DESC NULLS LAST;
     """)
 
-    # Detail (exactly your rows, lightly cleaned)
+    # Detail (your rows, cleaned)
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_recommendations_detail AS
     SELECT
-      billing_period,
+      recommendation_date,
       business_area,
       region,
       platform_norm AS platform,
@@ -120,25 +123,25 @@ def create_views(con: duckdb.DuckDBPyConnection):
     ORDER BY ta_est_savings_usd DESC NULLS LAST;
     """)
 
-    # Top instance types by savings (helps answer “what’s driving this?”)
+    # Top instance types by savings (helps “what’s driving it?”)
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_top_types AS
     SELECT
-      billing_period, business_area, region, platform_norm AS platform, instance_type,
-      SUM(COALESCE(ta_rec_instances,0))       AS rec_instances,
-      SUM(COALESCE(ta_est_savings_usd,0))     AS total_savings_usd,
-      AVG(NULLIF(avg_util_6mo_pct,0))         AS avg_util_6mo_pct
+      recommendation_date, business_area, region, platform_norm AS platform, instance_type,
+      SUM(COALESCE(ta_rec_instances,0))   AS rec_instances,
+      SUM(COALESCE(ta_est_savings_usd,0)) AS total_savings_usd,
+      AVG(NULLIF(avg_util_6mo_pct,0))     AS avg_util_6mo_pct
     FROM ec2_ta_norm
     GROUP BY 1,2,3,4,5
     ORDER BY total_savings_usd DESC, rec_instances DESC
     LIMIT 200;
     """)
 
-    # “Actions” (single opinionated table): Buy RIs; confidence from utilization
+    # Opinionated “Actions”: Buy RIs using TA recs; confidence from utilization
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_actions_explain AS
     SELECT
-      billing_period,
+      recommendation_date,
       business_area,
       region,
       platform_norm  AS platform,
@@ -153,24 +156,27 @@ def create_views(con: duckdb.DuckDBPyConnection):
       END AS confidence,
       CONCAT(
         'TA suggests ', COALESCE(CAST(ta_rec_instances AS VARCHAR), '0'),
-        ' RIs; est. $/mo saving = $', COALESCE(CAST(ROUND(ta_est_savings_usd,2) AS VARCHAR),'0'),
-        '. 6-mo avg util = ', COALESCE(CAST(ROUND(avg_util_6mo_pct,1) AS VARCHAR),'NA'), '%.'
+        ' RIs; est. saving $', COALESCE(CAST(ROUND(ta_est_savings_usd,2) AS VARCHAR),'0'),
+        '/mo. 6-mo util ', COALESCE(CAST(ROUND(avg_util_6mo_pct,1) AS VARCHAR),'NA'), '%.'
       ) AS reason
     FROM ec2_ta_norm
     WHERE ta_rec_instances IS NOT NULL AND ta_rec_instances > 0
     ORDER BY best_action_savings DESC NULLS LAST;
     """)
 
-    # Hotspots (BA × Region) using only TA savings
+    # Hotspots (BA × Region) by TA savings (keyed by recommendation_date)
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_hotspots AS
     SELECT
-      billing_period,
+      recommendation_date,
       business_area,
       region,
       SUM(COALESCE(ta_est_savings_usd,0)) AS total_savings_usd,
       SUM(COALESCE(ta_rec_instances,0))   AS total_rec_instances,
-      RANK() OVER (PARTITION BY billing_period ORDER BY SUM(COALESCE(ta_est_savings_usd,0)) DESC) AS rank_in_period
+      RANK() OVER (
+        PARTITION BY recommendation_date
+        ORDER BY SUM(COALESCE(ta_est_savings_usd,0)) DESC
+      ) AS rank_in_period
     FROM ec2_ta_norm
     GROUP BY 1,2,3
     ORDER BY total_savings_usd DESC;
