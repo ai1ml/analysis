@@ -64,257 +64,116 @@ def load_ta_csv(con: duckdb.DuckDBPyConnection, csv_path: str) -> int:
 # Views (platform-aware + agent features)
 # -----------------------------
 def create_views(con: duckdb.DuckDBPyConnection):
-    # 0) Normalize platform labels once → use ec2_ta_norm everywhere
+
+    # Normalize platform label once
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_norm AS
     SELECT
-      e.*,
+      *,
       CASE
-        WHEN platform ILIKE '%win%'                    THEN 'Windows'
+        WHEN platform ILIKE '%win%' THEN 'Windows'
         WHEN platform ILIKE '%linux%' OR platform ILIKE '%unix%' THEN 'Linux'
-        WHEN platform IS NULL OR TRIM(platform) = ''   THEN 'Unknown'
-        ELSE platform
+        ELSE COALESCE(platform,'Unknown')
       END AS platform_norm
-    FROM ec2_ta e;
+    FROM ec2_ta;
     """)
 
-    # 1) Main rollup: BA × Region × Platform (+ share % and rank)
+    # Rollup: BA × Region × Platform
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_by_ba_region_platform AS
     WITH base AS (
       SELECT
         billing_period, business_area, region, platform_norm AS platform,
-        COUNT(DISTINCT instance_id) AS instance_count,
-        SUM(COALESCE(ta_est_savings,0))               AS total_ta_savings,
-        SUM(COALESCE(ta_rightsize_savings,0))         AS total_ta_rightsize_savings,
-        SUM(COALESCE(ta_est_savings,0) + COALESCE(ta_rightsize_savings,0)) AS total_savings_all
+        SUM(COALESCE(ta_rec_instances,0))                   AS rec_instances,
+        SUM(COALESCE(ta_est_savings_usd,0))                 AS total_ta_savings_usd,
+        AVG(NULLIF(avg_util_6mo_pct,0))                     AS avg_util_6mo_pct
       FROM ec2_ta_norm
       GROUP BY 1,2,3,4
     ),
     tot AS (
-      SELECT billing_period, SUM(total_savings_all) AS grand_total
-      FROM base
-      GROUP BY 1
+      SELECT billing_period, SUM(total_ta_savings_usd) AS grand_total
+      FROM base GROUP BY 1
     )
     SELECT
       b.*,
-      ROUND(100.0 * b.total_savings_all / NULLIF(t.grand_total,0), 2) AS savings_share_pct,
-      RANK() OVER (PARTITION BY b.billing_period ORDER BY b.total_savings_all DESC) AS savings_rank
+      ROUND(100.0 * b.total_ta_savings_usd / NULLIF(t.grand_total,0), 2) AS savings_share_pct,
+      RANK() OVER (PARTITION BY b.billing_period ORDER BY b.total_ta_savings_usd DESC) AS savings_rank
     FROM base b
     JOIN tot t USING (billing_period)
-    ORDER BY b.total_savings_all DESC NULLS LAST, b.instance_count DESC;
+    ORDER BY total_ta_savings_usd DESC NULLS LAST;
     """)
 
-    # 2) Detailed TA recommendations (drilldown)
+    # Detail (exactly your rows, lightly cleaned)
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_recommendations_detail AS
-    SELECT
-      billing_period,
-      account_name,
-      business_area,
-      region,
-      platform_norm AS platform,
-      instance_id,
-      instance_type           AS current_instance_type,
-      recommended_instance_type,
-      ta_rec_instances,
-      ta_est_savings,
-      ta_rightsize_savings,
-      current_cost_usd,
-      avg_cpu_14d
-    FROM ec2_ta_norm
-    ORDER BY COALESCE(ta_est_savings,0) + COALESCE(ta_rightsize_savings,0) DESC NULLS LAST;
-    """)
-
-    # 3) Spot candidates (heuristic): Linux + has cost → ~60% saving vs OD
-    con.execute("""
-    CREATE OR REPLACE VIEW ec2_ta_spot_candidates AS
-    SELECT
-      billing_period,
-      business_area,
-      region,
-      platform_norm AS platform,
-      instance_id,
-      instance_type           AS current_instance_type,
-      current_cost_usd,
-      CASE
-        WHEN platform_norm = 'Linux' AND current_cost_usd IS NOT NULL AND current_cost_usd > 0
-          THEN ROUND(current_cost_usd * 0.60, 2)
-      END AS est_spot_savings,
-      CASE
-        WHEN platform_norm = 'Linux' THEN 'Linux OK for Spot (validate interruption tolerance)'
-        WHEN platform_norm = 'Windows' THEN 'Windows licensing/eligibility often limits Spot'
-        ELSE 'Unknown platform'
-      END AS reason
-    FROM ec2_ta_norm
-    ORDER BY est_spot_savings DESC NULLS LAST;
-    """)
-
-    # 4) Scheduling candidates (heuristic): likely non-prod 24×7 → switch to 5×12 (~65%)
-    con.execute("""
-    CREATE OR REPLACE VIEW ec2_ta_scheduling_candidates AS
-    SELECT
-      billing_period,
-      business_area,
-      region,
-      platform_norm AS platform,
-      instance_id,
-      instance_type           AS current_instance_type,
-      current_cost_usd,
-      CASE
-        WHEN (COALESCE(usage_pattern,'') ILIKE '%24x7%' OR usage_pattern IS NULL)
-         AND (
-              business_area ILIKE '%dev%' OR business_area ILIKE '%test%' OR business_area ILIKE '%stage%'
-              OR instance_id  ILIKE '%dev%' OR instance_id  ILIKE '%test%' OR instance_id  ILIKE '%stage%'
-             )
-         AND current_cost_usd IS NOT NULL AND current_cost_usd > 0
-        THEN ROUND(current_cost_usd * 0.65, 2)
-      END AS est_sched_savings,
-      'Non-prod 24×7 → schedule 5×12 (~65% saving assumed)' AS reason
-    FROM ec2_ta_norm
-    ORDER BY est_sched_savings DESC NULLS LAST;
-    """)
-
-    # 5) High utilization (possible upsize / reserved capacity)
-    con.execute("""
-    CREATE OR REPLACE VIEW ec2_ta_high_utilization AS
-    SELECT
-      billing_period,
-      business_area,
-      region,
-      platform_norm AS platform,
-      instance_id,
-      instance_type           AS current_instance_type,
-      avg_cpu_14d,
-      current_cost_usd
-    FROM ec2_ta_norm
-    WHERE avg_cpu_14d IS NOT NULL AND avg_cpu_14d >= 90
-    ORDER BY avg_cpu_14d DESC, current_cost_usd DESC NULLS LAST;
-    """)
-
-    # 6) Top drivers (which types drive savings within BA/Region/Platform)
-    con.execute("""
-    CREATE OR REPLACE VIEW ec2_ta_top_drivers AS
     SELECT
       billing_period,
       business_area,
       region,
       platform_norm AS platform,
       instance_type,
-      COUNT(*) AS instances,
-      SUM(COALESCE(ta_est_savings,0) + COALESCE(ta_rightsize_savings,0)) AS total_savings
+      avg_util_6mo_pct,
+      recurring_monthly_cost_usd,
+      ta_rec_instances,
+      ta_est_savings_usd
+    FROM ec2_ta_norm
+    ORDER BY ta_est_savings_usd DESC NULLS LAST;
+    """)
+
+    # Top instance types by savings (helps answer “what’s driving this?”)
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_top_types AS
+    SELECT
+      billing_period, business_area, region, platform_norm AS platform, instance_type,
+      SUM(COALESCE(ta_rec_instances,0))       AS rec_instances,
+      SUM(COALESCE(ta_est_savings_usd,0))     AS total_savings_usd,
+      AVG(NULLIF(avg_util_6mo_pct,0))         AS avg_util_6mo_pct
     FROM ec2_ta_norm
     GROUP BY 1,2,3,4,5
-    ORDER BY total_savings DESC, instances DESC
+    ORDER BY total_savings_usd DESC, rec_instances DESC
     LIMIT 200;
     """)
 
-    # 7) Platform share within BA (helps narrative; % + rank)
-    con.execute("""
-    CREATE OR REPLACE VIEW ec2_ta_ba_platform_share AS
-    WITH base AS (
-      SELECT
-        billing_period, business_area, platform_norm AS platform,
-        SUM(COALESCE(ta_est_savings,0) + COALESCE(ta_rightsize_savings,0)) AS platform_savings
-      FROM ec2_ta_norm
-      GROUP BY 1,2,3
-    ),
-    tot AS (
-      SELECT billing_period, business_area, SUM(platform_savings) AS ba_total
-      FROM base GROUP BY 1,2
-    )
-    SELECT
-      b.billing_period,
-      b.business_area,
-      b.platform,
-      b.platform_savings,
-      t.ba_total,
-      ROUND(100.0 * b.platform_savings / NULLIF(t.ba_total,0), 2) AS platform_share_pct,
-      RANK() OVER (PARTITION BY b.billing_period, b.business_area ORDER BY b.platform_savings DESC) AS platform_rank_in_ba
-    FROM base b
-    JOIN tot t USING (billing_period, business_area)
-    ORDER BY b.business_area, platform_share_pct DESC NULLS LAST;
-    """)
-
-    # 8) Unified actions (per instance) + best action selection
-    con.execute("""
-    CREATE OR REPLACE VIEW ec2_ta_actions AS
-    SELECT
-      billing_period, business_area, region, platform_norm AS platform,
-      instance_id, instance_type AS current_instance_type,
-      COALESCE(ta_rightsize_savings,0) AS rightsize_savings,
-      current_cost_usd,
-      avg_cpu_14d
-    FROM ec2_ta_norm;
-    """)
-
-    con.execute("""
-    CREATE OR REPLACE VIEW ec2_ta_actions_ranked AS
-    SELECT
-      a.*,
-      COALESCE(s.est_spot_savings, 0)  AS spot_savings,
-      COALESCE(sc.est_sched_savings, 0) AS schedule_savings,
-      -- choose best action by $ (simple rule; ties broken by order below)
-      CASE
-        WHEN COALESCE(s.est_spot_savings,0) >= GREATEST(COALESCE(a.rightsize_savings,0), COALESCE(sc.est_sched_savings,0))
-          THEN 'spot'
-        WHEN COALESCE(sc.est_sched_savings,0) >= GREATEST(COALESCE(a.rightsize_savings,0), COALESCE(s.est_spot_savings,0))
-          THEN 'schedule'
-        WHEN COALESCE(a.rightsize_savings,0) > 0
-          THEN 'rightsize'
-        ELSE 'none'
-      END AS best_action,
-      GREATEST(COALESCE(s.est_spot_savings,0), COALESCE(sc.est_sched_savings,0), COALESCE(a.rightsize_savings,0)) AS best_action_savings
-    FROM ec2_ta_actions a
-    LEFT JOIN ec2_ta_spot_candidates       s  USING (billing_period,business_area,region,platform,instance_id)
-    LEFT JOIN ec2_ta_scheduling_candidates sc USING (billing_period,business_area,region,platform,instance_id)
-    """)
-
-    # 9) Scoring (confidence) + explanation text (reason)
-    con.execute("""
-    CREATE OR REPLACE VIEW ec2_ta_actions_scored AS
-    SELECT
-      ar.*,
-      CASE ar.best_action
-        WHEN 'spot' THEN CASE WHEN ar.platform = 'Linux' THEN 'High' ELSE 'Low' END
-        WHEN 'schedule' THEN CASE
-              WHEN (business_area ILIKE '%dev%' OR instance_id ILIKE '%dev%' OR business_area ILIKE '%test%' OR instance_id ILIKE '%test%' OR business_area ILIKE '%stage%' OR instance_id ILIKE '%stage%')
-                THEN 'High' ELSE 'Medium' END
-        WHEN 'rightsize' THEN CASE
-              WHEN ar.avg_cpu_14d IS NOT NULL AND ar.avg_cpu_14d < 30 THEN 'High'
-              WHEN ar.avg_cpu_14d IS NULL THEN 'Medium'
-              ELSE 'Low' END
-        ELSE 'Low'
-      END AS confidence
-    FROM ec2_ta_actions_ranked ar;
-    """)
-
+    # “Actions” (single opinionated table): Buy RIs; confidence from utilization
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_actions_explain AS
     SELECT
-      sc.*,
-      CASE sc.best_action
-        WHEN 'spot' THEN 'Linux workload: consider Spot (validate interruption tolerance).'
-        WHEN 'schedule' THEN 'Likely non-prod 24×7: consider 5×12 schedule.'
-        WHEN 'rightsize' THEN 'Rightsize recommended by TA / low CPU headroom.'
-        ELSE 'No clear action.'
-      END AS reason
-    FROM ec2_ta_actions_scored sc
-    ORDER BY best_action_savings DESC NULLS LAST, rightsize_savings DESC NULLS LAST;
+      billing_period,
+      business_area,
+      region,
+      platform_norm  AS platform,
+      instance_type,
+      ta_rec_instances,
+      ta_est_savings_usd               AS best_action_savings,
+      'buy_reserved_instances'         AS best_action,
+      CASE
+        WHEN avg_util_6mo_pct >= 60 THEN 'High'
+        WHEN avg_util_6mo_pct BETWEEN 30 AND 60 THEN 'Medium'
+        ELSE 'Low'
+      END AS confidence,
+      CONCAT(
+        'TA suggests ', COALESCE(CAST(ta_rec_instances AS VARCHAR), '0'),
+        ' RIs; est. $/mo saving = $', COALESCE(CAST(ROUND(ta_est_savings_usd,2) AS VARCHAR),'0'),
+        '. 6-mo avg util = ', COALESCE(CAST(ROUND(avg_util_6mo_pct,1) AS VARCHAR),'NA'), '%.'
+      ) AS reason
+    FROM ec2_ta_norm
+    WHERE ta_rec_instances IS NOT NULL AND ta_rec_instances > 0
+    ORDER BY best_action_savings DESC NULLS LAST;
     """)
 
-    # 10) Hotspots (BA×Region totals with rank)
+    # Hotspots (BA × Region) using only TA savings
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_hotspots AS
     SELECT
       billing_period,
       business_area,
       region,
-      SUM(COALESCE(ta_est_savings,0) + COALESCE(ta_rightsize_savings,0)) AS total_savings,
-      RANK() OVER (PARTITION BY billing_period ORDER BY SUM(COALESCE(ta_est_savings,0) + COALESCE(ta_rightsize_savings,0)) DESC) AS rank_in_period
+      SUM(COALESCE(ta_est_savings_usd,0)) AS total_savings_usd,
+      SUM(COALESCE(ta_rec_instances,0))   AS total_rec_instances,
+      RANK() OVER (PARTITION BY billing_period ORDER BY SUM(COALESCE(ta_est_savings_usd,0)) DESC) AS rank_in_period
     FROM ec2_ta_norm
     GROUP BY 1,2,3
-    ORDER BY total_savings DESC;
+    ORDER BY total_savings_usd DESC;
     """)
 
 # (optional quick run)
