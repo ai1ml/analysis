@@ -63,27 +63,45 @@ def load_ta_csv(con: duckdb.DuckDBPyConnection, csv_path: str) -> int:
 # -----------------------------
 # Views (platform-aware + agent features)
 # -----------------------------
-def create_views(con: duckdb.DuckDBPyConnection):
-
-    # Normalize platform once
+def create_views(con):
+    # 0) Normalize platform to family + flavor
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_norm AS
     SELECT
-      *,
+      e.*,
+
+      -- High-level family (simple)
       CASE
-        WHEN platform ILIKE '%win%' THEN 'Windows'
+        WHEN platform ILIKE '%win%'                          THEN 'Windows'
         WHEN platform ILIKE '%linux%' OR platform ILIKE '%unix%' THEN 'Linux'
-        ELSE COALESCE(platform,'Unknown')
-      END AS platform_norm
-    FROM ec2_ta;
+        ELSE 'Other'
+      END AS platform_family,
+
+      -- More detailed flavor (keeps Windows variants + common Linux flavors)
+      CASE
+        WHEN platform ILIKE '%windows%sql%enterprise%'       THEN 'Windows SQL Ent'
+        WHEN platform ILIKE '%windows%sql%standard%'         THEN 'Windows SQL Std'
+        WHEN platform ILIKE '%windows%sql%'                  THEN 'Windows SQL'
+        WHEN platform ILIKE '%windows%'                      THEN 'Windows'
+
+        WHEN platform ILIKE '%red hat%' OR platform ILIKE '%rhel%' THEN 'RHEL'
+        WHEN platform ILIKE '%suse%'                          THEN 'SUSE'
+        WHEN platform ILIKE '%amazon linux%'                  THEN 'Amazon Linux'
+        WHEN platform ILIKE '%ubuntu%'                        THEN 'Ubuntu'
+
+        WHEN platform IS NULL OR TRIM(platform) = ''         THEN 'Unknown'
+        ELSE platform
+      END AS platform_flavor
+
+    FROM ec2_ta e;
     """)
 
-    # Rollup: BA × Region × Platform (keyed by recommendation_date)
+    # 1) Rollup for dashboards: BA × Region × platform_family
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_by_ba_region_platform AS
     WITH base AS (
       SELECT
-        recommendation_date, business_area, region, platform_norm AS platform,
+        recommendation_date, business_area, region, platform_family AS platform,
         SUM(COALESCE(ta_rec_instances,0))               AS rec_instances,
         SUM(COALESCE(ta_est_savings_usd,0))             AS total_ta_savings_usd,
         AVG(NULLIF(avg_util_6mo_pct,0))                 AS avg_util_6mo_pct
@@ -103,17 +121,31 @@ def create_views(con: duckdb.DuckDBPyConnection):
       ) AS savings_rank
     FROM base b
     JOIN tot t USING (recommendation_date)
-    ORDER BY total_ta_savings_usd DESC NULLS LAST;
+    ORDER BY total_ta_savings_usd DESC NULLS LAST, rec_instances DESC NULLS LAST;
     """)
 
-    # Detail (your rows, cleaned)
+    # 2) Drill-down rollup: BA × Region × platform_flavor (richer)
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_by_ba_region_flavor AS
+    SELECT
+      recommendation_date, business_area, region, platform_flavor,
+      SUM(COALESCE(ta_rec_instances,0))               AS rec_instances,
+      SUM(COALESCE(ta_est_savings_usd,0))             AS total_ta_savings_usd,
+      AVG(NULLIF(avg_util_6mo_pct,0))                 AS avg_util_6mo_pct
+    FROM ec2_ta_norm
+    GROUP BY 1,2,3,4
+    ORDER BY total_ta_savings_usd DESC NULLS LAST, rec_instances DESC NULLS LAST;
+    """)
+
+    # 3) Detail table: include both family + flavor for agent answers
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_recommendations_detail AS
     SELECT
       recommendation_date,
       business_area,
       region,
-      platform_norm AS platform,
+      platform_family  AS platform,   -- keep 'platform' = family for simpler filters
+      platform_flavor,
       instance_type,
       avg_util_6mo_pct,
       recurring_monthly_cost_usd,
@@ -123,28 +155,15 @@ def create_views(con: duckdb.DuckDBPyConnection):
     ORDER BY ta_est_savings_usd DESC NULLS LAST;
     """)
 
-    # Top instance types by savings (helps “what’s driving it?”)
-    con.execute("""
-    CREATE OR REPLACE VIEW ec2_ta_top_types AS
-    SELECT
-      recommendation_date, business_area, region, platform_norm AS platform, instance_type,
-      SUM(COALESCE(ta_rec_instances,0))   AS rec_instances,
-      SUM(COALESCE(ta_est_savings_usd,0)) AS total_savings_usd,
-      AVG(NULLIF(avg_util_6mo_pct,0))     AS avg_util_6mo_pct
-    FROM ec2_ta_norm
-    GROUP BY 1,2,3,4,5
-    ORDER BY total_savings_usd DESC, rec_instances DESC
-    LIMIT 200;
-    """)
-
-    # Opinionated “Actions”: Buy RIs using TA recs; confidence from utilization
+    # 4) Opinionated actions (Buy RIs) — include both platform levels
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_actions_explain AS
     SELECT
       recommendation_date,
       business_area,
       region,
-      platform_norm  AS platform,
+      platform_family  AS platform,
+      platform_flavor,
       instance_type,
       ta_rec_instances,
       ta_est_savings_usd               AS best_action_savings,
@@ -157,14 +176,15 @@ def create_views(con: duckdb.DuckDBPyConnection):
       CONCAT(
         'TA suggests ', COALESCE(CAST(ta_rec_instances AS VARCHAR), '0'),
         ' RIs; est. saving $', COALESCE(CAST(ROUND(ta_est_savings_usd,2) AS VARCHAR),'0'),
-        '/mo. 6-mo util ', COALESCE(CAST(ROUND(avg_util_6mo_pct,1) AS VARCHAR),'NA'), '%.'
+        '/mo. 6-mo util ', COALESCE(CAST(ROUND(avg_util_6mo_pct,1) AS VARCHAR),'NA'),
+        '%. Platform flavor: ', platform_flavor, '.'
       ) AS reason
     FROM ec2_ta_norm
     WHERE ta_rec_instances IS NOT NULL AND ta_rec_instances > 0
     ORDER BY best_action_savings DESC NULLS LAST;
     """)
 
-    # Hotspots (BA × Region) by TA savings (keyed by recommendation_date)
+    # 5) Hotspots (BA × Region) keyed by recommendation_date (unchanged)
     con.execute("""
     CREATE OR REPLACE VIEW ec2_ta_hotspots AS
     SELECT
