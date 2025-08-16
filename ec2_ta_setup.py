@@ -1,229 +1,325 @@
-import os, io, re, duckdb, pandas as pd, streamlit as st
-from datetime import datetime
+# ec2_ta_setup.py
+# EC2 Trusted Advisor (TA) analysis — platform-aware, agent-friendly views
+# Usage:
+#   import duckdb, ec2_ta_setup as ta
+#   con = duckdb.connect()
+#   ta.load_ta_csv(con, "path/to/ec2_ta.csv")
+#   ta.create_views(con)
 
-# Import your setup modules
-import rds_agent_setup as rds
-import ec2_ta_setup as ec2
+import re
+import duckdb
+import pandas as pd
 
-st.set_page_config(page_title="Cloud Savings — RDS + EC2 (MVP)", layout="wide")
-st.title("Cloud Savings — RDS + EC2 (MVP)")
-
-# Create or reuse a DuckDB connection
-if "con" not in st.session_state:
-    st.session_state.con = duckdb.connect(":memory:")
-con = st.session_state.con
-
-# -------- Helpers ----------
-def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+# -----------------------------
+# Helpers
+# -----------------------------
+def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [re.sub(r"\W+","_", c.strip()).lower() for c in df.columns]
-    return df
+    df.columns = [re.sub(r"\W+", "_", c.strip()).lower() for c in df.columns]
 
-def load_local_rds_csvs(folder="data"):
-    if not os.path.isdir(folder):
-        os.makedirs(folder, exist_ok=True)
-        return 0
-    files = [f for f in os.listdir(folder) if f.lower().endswith(".csv")]
-    if not files:
-        return 0
-    frames = []
-    for f in files:
-        df = pd.read_csv(os.path.join(folder, f))
-        frames.append(normalize_cols(df))
-    if not frames:
-        return 0
-    df_all = pd.concat(frames, ignore_index=True)
-    con.execute("DELETE FROM rds_usage")
-    con.register("rds_df", df_all)
-    con.execute("INSERT INTO rds_usage SELECT * FROM rds_df")
-    con.unregister("rds_df")
-    return len(df_all)
+    # map common aliases -> canonical field names we use in SQL
+    alias_map = {
+        "number_of_instances_to_purchase": "ta_rec_instances",
+        "existing_savings_usd": "ta_est_savings",
+        "rightsize_cost_avoidance_usd": "ta_rightsize_savings",
+        "recommended_instance_type": "recommended_instance_type",
+        "instance_type": "instance_type",
+        "avg_cpu_14d": "avg_cpu_14d",
+        "current_cost_usd": "current_cost_usd",
+        "usage_pattern": "usage_pattern",
+    }
 
-def load_local_ec2_csvs(folder="data_ec2"):
-    return ec2.load_ec2_ta_csvs_from_folder(con, folder=folder)
+    # ensure required columns exist
+    want_cols = [
+        "billing_period","account_name","business_area","instance_id","region","platform",
+        "instance_type","ta_rec_instances","ta_est_savings","recommended_instance_type",
+        "ta_rightsize_savings","current_cost_usd","avg_cpu_14d","usage_pattern"
+    ]
+    # rename where possible
+    for k, v in alias_map.items():
+        if k in df.columns and v not in df.columns:
+            df.rename(columns={k: v}, inplace=True)
+    # add missing as None
+    for c in want_cols:
+        if c not in df.columns:
+            df[c] = None
 
-def distinct(col, table):
-    try:
-        return [r[0] for r in con.execute(
-            f"SELECT DISTINCT {col} FROM {table} WHERE {col} IS NOT NULL ORDER BY {col}"
-        ).fetchall()]
-    except:
-        return []
+    return df[want_cols]
 
-# ---------------- Sidebar actions ----------------
-st.sidebar.header("Data loading")
-colA, colB = st.sidebar.columns(2)
-with colA:
-    if st.button("Reload RDS CSVs"):
-        n = load_local_rds_csvs("data")
-        st.success(f"RDS: loaded {n} rows" if n else "RDS: no CSVs found in ./data/")
-with colB:
-    if st.button("Reload EC2 TA CSVs"):
-        n = load_local_ec2_csvs("data_ec2")
-        st.success(f"EC2: loaded {n} rows" if n else "EC2: no CSVs found in ./data_ec2/")
+# -----------------------------
+# Load TA CSV → ec2_ta table
+# -----------------------------
+def load_ta_csv(con: duckdb.DuckDBPyConnection, csv_path: str) -> int:
+    """Loads & normalizes a TA CSV into table `ec2_ta`. Returns row count."""
+    df = pd.read_csv(csv_path)
+    df = _norm_cols(df)
+    con.execute("CREATE TABLE IF NOT EXISTS ec2_ta AS SELECT * FROM df WHERE 1=0")  # schema only
+    con.execute("DELETE FROM ec2_ta")
+    con.register("df", df)
+    con.execute("INSERT INTO ec2_ta SELECT * FROM df")
+    con.unregister("df")
+    return len(df)
 
-if st.sidebar.button("Build RDS sizes + views (+prices if creds)"):
-    rds.initialize_after_loading_usage(con)
-    st.success("RDS: sizes/views ready (pricing refreshed if AWS creds configured).")
+# -----------------------------
+# Views (platform-aware + agent features)
+# -----------------------------
+def create_views(con: duckdb.DuckDBPyConnection):
+    # 0) Normalize platform labels once → use ec2_ta_norm everywhere
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_norm AS
+    SELECT
+      e.*,
+      CASE
+        WHEN platform ILIKE '%win%'                    THEN 'Windows'
+        WHEN platform ILIKE '%linux%' OR platform ILIKE '%unix%' THEN 'Linux'
+        WHEN platform IS NULL OR TRIM(platform) = ''   THEN 'Unknown'
+        ELSE platform
+      END AS platform_norm
+    FROM ec2_ta e;
+    """)
 
-if st.sidebar.button("Build EC2 views"):
-    ec2.create_views_ec2(con)
-    st.success("EC2: TA views created.")
+    # 1) Main rollup: BA × Region × Platform (+ share % and rank)
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_by_ba_region_platform AS
+    WITH base AS (
+      SELECT
+        billing_period, business_area, region, platform_norm AS platform,
+        COUNT(DISTINCT instance_id) AS instance_count,
+        SUM(COALESCE(ta_est_savings,0))               AS total_ta_savings,
+        SUM(COALESCE(ta_rightsize_savings,0))         AS total_ta_rightsize_savings,
+        SUM(COALESCE(ta_est_savings,0) + COALESCE(ta_rightsize_savings,0)) AS total_savings_all
+      FROM ec2_ta_norm
+      GROUP BY 1,2,3,4
+    ),
+    tot AS (
+      SELECT billing_period, SUM(total_savings_all) AS grand_total
+      FROM base
+      GROUP BY 1
+    )
+    SELECT
+      b.*,
+      ROUND(100.0 * b.total_savings_all / NULLIF(t.grand_total,0), 2) AS savings_share_pct,
+      RANK() OVER (PARTITION BY b.billing_period ORDER BY b.total_savings_all DESC) AS savings_rank
+    FROM base b
+    JOIN tot t USING (billing_period)
+    ORDER BY b.total_savings_all DESC NULLS LAST, b.instance_count DESC;
+    """)
 
-st.sidebar.divider()
-if st.sidebar.button("Refresh AWS prices now (RDS)"):
-    try:
-        rds.refresh_price_rds_from_usage(con, deployment="Single-AZ", engine="Any")
-        st.success("price_rds refreshed.")
-    except Exception as e:
-        st.error(f"Pricing refresh failed (expected if no AWS creds): {e}")
+    # 2) Detailed TA recommendations (drilldown)
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_recommendations_detail AS
+    SELECT
+      billing_period,
+      account_name,
+      business_area,
+      region,
+      platform_norm AS platform,
+      instance_id,
+      instance_type           AS current_instance_type,
+      recommended_instance_type,
+      ta_rec_instances,
+      ta_est_savings,
+      ta_rightsize_savings,
+      current_cost_usd,
+      avg_cpu_14d
+    FROM ec2_ta_norm
+    ORDER BY COALESCE(ta_est_savings,0) + COALESCE(ta_rightsize_savings,0) DESC NULLS LAST;
+    """)
 
-st.divider()
+    # 3) Spot candidates (heuristic): Linux + has cost → ~60% saving vs OD
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_spot_candidates AS
+    SELECT
+      billing_period,
+      business_area,
+      region,
+      platform_norm AS platform,
+      instance_id,
+      instance_type           AS current_instance_type,
+      current_cost_usd,
+      CASE
+        WHEN platform_norm = 'Linux' AND current_cost_usd IS NOT NULL AND current_cost_usd > 0
+          THEN ROUND(current_cost_usd * 0.60, 2)
+      END AS est_spot_savings,
+      CASE
+        WHEN platform_norm = 'Linux' THEN 'Linux OK for Spot (validate interruption tolerance)'
+        WHEN platform_norm = 'Windows' THEN 'Windows licensing/eligibility often limits Spot'
+        ELSE 'Unknown platform'
+      END AS reason
+    FROM ec2_ta_norm
+    ORDER BY est_spot_savings DESC NULLS LAST;
+    """)
 
-# ---------------- Filters (RDS) ----------------
-st.subheader("RDS — Optimizations")
-rds_months = con.execute("SELECT DISTINCT billing_period FROM rds_usage ORDER BY billing_period DESC").fetchdf()
-rds_BAs    = distinct("BA", "rds_usage")
-rds_regions= distinct("region", "rds_usage")
+    # 4) Scheduling candidates (heuristic): likely non-prod 24×7 → switch to 5×12 (~65%)
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_scheduling_candidates AS
+    SELECT
+      billing_period,
+      business_area,
+      region,
+      platform_norm AS platform,
+      instance_id,
+      instance_type           AS current_instance_type,
+      current_cost_usd,
+      CASE
+        WHEN (COALESCE(usage_pattern,'') ILIKE '%24x7%' OR usage_pattern IS NULL)
+         AND (
+              business_area ILIKE '%dev%' OR business_area ILIKE '%test%' OR business_area ILIKE '%stage%'
+              OR instance_id  ILIKE '%dev%' OR instance_id  ILIKE '%test%' OR instance_id  ILIKE '%stage%'
+             )
+         AND current_cost_usd IS NOT NULL AND current_cost_usd > 0
+        THEN ROUND(current_cost_usd * 0.65, 2)
+      END AS est_sched_savings,
+      'Non-prod 24×7 → schedule 5×12 (~65% saving assumed)' AS reason
+    FROM ec2_ta_norm
+    ORDER BY est_sched_savings DESC NULLS LAST;
+    """)
 
-fc1, fc2, fc3 = st.columns(3)
-rds_sel_month = fc1.selectbox("RDS: Billing period", options=["(all)"] + rds_months["billing_period"].astype(str).tolist())
-rds_sel_ba    = fc2.selectbox("RDS: Business Unit (BA)", options=["(all)"] + rds_BAs)
-rds_sel_region= fc3.selectbox("RDS: Region", options=["(all)"] + rds_regions)
+    # 5) High utilization (possible upsize / reserved capacity)
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_high_utilization AS
+    SELECT
+      billing_period,
+      business_area,
+      region,
+      platform_norm AS platform,
+      instance_id,
+      instance_type           AS current_instance_type,
+      avg_cpu_14d,
+      current_cost_usd
+    FROM ec2_ta_norm
+    WHERE avg_cpu_14d IS NOT NULL AND avg_cpu_14d >= 90
+    ORDER BY avg_cpu_14d DESC, current_cost_usd DESC NULLS LAST;
+    """)
 
-def rds_where(base="1=1"):
-    wc = [base]
-    if rds_sel_month != "(all)":
-        wc.append(f"billing_period = DATE '{rds_sel_month}'")
-    if rds_sel_ba != "(all)":
-        wc.append(f"BA = '{rds_sel_ba.replace(\"'\",\"''\")}'")
-    if rds_sel_region != "(all)":
-        wc.append(f"region = '{rds_sel_region.replace(\"'\",\"''\")}'")
-    return " AND ".join(wc)
+    # 6) Top drivers (which types drive savings within BA/Region/Platform)
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_top_drivers AS
+    SELECT
+      billing_period,
+      business_area,
+      region,
+      platform_norm AS platform,
+      instance_type,
+      COUNT(*) AS instances,
+      SUM(COALESCE(ta_est_savings,0) + COALESCE(ta_rightsize_savings,0)) AS total_savings
+    FROM ec2_ta_norm
+    GROUP BY 1,2,3,4,5
+    ORDER BY total_savings DESC, instances DESC
+    LIMIT 200;
+    """)
 
-tabR1, tabR2, tabR3, tabR4 = st.tabs(["Actions (ranked)", "Underutilized", "Rightsize", "High CPU"])
+    # 7) Platform share within BA (helps narrative; % + rank)
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_ba_platform_share AS
+    WITH base AS (
+      SELECT
+        billing_period, business_area, platform_norm AS platform,
+        SUM(COALESCE(ta_est_savings,0) + COALESCE(ta_rightsize_savings,0)) AS platform_savings
+      FROM ec2_ta_norm
+      GROUP BY 1,2,3
+    ),
+    tot AS (
+      SELECT billing_period, business_area, SUM(platform_savings) AS ba_total
+      FROM base GROUP BY 1,2
+    )
+    SELECT
+      b.billing_period,
+      b.business_area,
+      b.platform,
+      b.platform_savings,
+      t.ba_total,
+      ROUND(100.0 * b.platform_savings / NULLIF(t.ba_total,0), 2) AS platform_share_pct,
+      RANK() OVER (PARTITION BY b.billing_period, b.business_area ORDER BY b.platform_savings DESC) AS platform_rank_in_ba
+    FROM base b
+    JOIN tot t USING (billing_period, business_area)
+    ORDER BY b.business_area, platform_share_pct DESC NULLS LAST;
+    """)
 
-with tabR1:
-    q = f"SELECT * FROM rds_actions_ranked WHERE {rds_where('1=1')} ORDER BY est_monthly_savings_usd DESC NULLS LAST, current_cost_usd DESC LIMIT 500"
-    st.caption(q)
-    st.dataframe(con.execute(q).fetchdf())
-    df = con.execute(f"SELECT BA, action, SUM(COALESCE(est_monthly_savings_usd,0)) AS total_savings FROM rds_actions_ranked WHERE {rds_where('1=1')} GROUP BY 1,2 ORDER BY total_savings DESC").fetchdf()
-    st.write("RDS Savings by BA & Action")
-    st.dataframe(df)
+    # 8) Unified actions (per instance) + best action selection
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_actions AS
+    SELECT
+      billing_period, business_area, region, platform_norm AS platform,
+      instance_id, instance_type AS current_instance_type,
+      COALESCE(ta_rightsize_savings,0) AS rightsize_savings,
+      current_cost_usd,
+      avg_cpu_14d
+    FROM ec2_ta_norm;
+    """)
 
-with tabR2:
-    q = f"SELECT * FROM rds_underutilized WHERE {rds_where('1=1')} ORDER BY cost_usd DESC LIMIT 500"
-    st.caption(q)
-    st.dataframe(con.execute(q).fetchdf())
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_actions_ranked AS
+    SELECT
+      a.*,
+      COALESCE(s.est_spot_savings, 0)  AS spot_savings,
+      COALESCE(sc.est_sched_savings, 0) AS schedule_savings,
+      -- choose best action by $ (simple rule; ties broken by order below)
+      CASE
+        WHEN COALESCE(s.est_spot_savings,0) >= GREATEST(COALESCE(a.rightsize_savings,0), COALESCE(sc.est_sched_savings,0))
+          THEN 'spot'
+        WHEN COALESCE(sc.est_sched_savings,0) >= GREATEST(COALESCE(a.rightsize_savings,0), COALESCE(s.est_spot_savings,0))
+          THEN 'schedule'
+        WHEN COALESCE(a.rightsize_savings,0) > 0
+          THEN 'rightsize'
+        ELSE 'none'
+      END AS best_action,
+      GREATEST(COALESCE(s.est_spot_savings,0), COALESCE(sc.est_sched_savings,0), COALESCE(a.rightsize_savings,0)) AS best_action_savings
+    FROM ec2_ta_actions a
+    LEFT JOIN ec2_ta_spot_candidates       s  USING (billing_period,business_area,region,platform,instance_id)
+    LEFT JOIN ec2_ta_scheduling_candidates sc USING (billing_period,business_area,region,platform,instance_id)
+    """)
 
-with tabR3:
-    q = f"""
-    SELECT billing_period, account_name, BA, db_id, region, current_class, recommended_class,
-           current_cost_usd, est_monthly_savings_usd, avg_cpu_14d, price_date
-    FROM rds_rightsize_next_smaller
-    WHERE {rds_where('1=1')}
-    ORDER BY est_monthly_savings_usd DESC NULLS LAST
-    LIMIT 500
-    """
-    st.caption(q)
-    st.dataframe(con.execute(q).fetchdf())
+    # 9) Scoring (confidence) + explanation text (reason)
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_actions_scored AS
+    SELECT
+      ar.*,
+      CASE ar.best_action
+        WHEN 'spot' THEN CASE WHEN ar.platform = 'Linux' THEN 'High' ELSE 'Low' END
+        WHEN 'schedule' THEN CASE
+              WHEN (business_area ILIKE '%dev%' OR instance_id ILIKE '%dev%' OR business_area ILIKE '%test%' OR instance_id ILIKE '%test%' OR business_area ILIKE '%stage%' OR instance_id ILIKE '%stage%')
+                THEN 'High' ELSE 'Medium' END
+        WHEN 'rightsize' THEN CASE
+              WHEN ar.avg_cpu_14d IS NOT NULL AND ar.avg_cpu_14d < 30 THEN 'High'
+              WHEN ar.avg_cpu_14d IS NULL THEN 'Medium'
+              ELSE 'Low' END
+        ELSE 'Low'
+      END AS confidence
+    FROM ec2_ta_actions_ranked ar;
+    """)
 
-with tabR4:
-    q = f"""
-    SELECT billing_period, account_name, BA, db_id, region, instance_class,
-           hours, cost_usd, avg_cpu_14d, recommendation
-    FROM rds_high_utilization
-    WHERE {rds_where('1=1')}
-    ORDER BY avg_cpu_14d DESC, cost_usd DESC
-    LIMIT 500
-    """
-    st.caption(q)
-    st.dataframe(con.execute(q).fetchdf())
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_actions_explain AS
+    SELECT
+      sc.*,
+      CASE sc.best_action
+        WHEN 'spot' THEN 'Linux workload: consider Spot (validate interruption tolerance).'
+        WHEN 'schedule' THEN 'Likely non-prod 24×7: consider 5×12 schedule.'
+        WHEN 'rightsize' THEN 'Rightsize recommended by TA / low CPU headroom.'
+        ELSE 'No clear action.'
+      END AS reason
+    FROM ec2_ta_actions_scored sc
+    ORDER BY best_action_savings DESC NULLS LAST, rightsize_savings DESC NULLS LAST;
+    """)
 
-st.divider()
+    # 10) Hotspots (BA×Region totals with rank)
+    con.execute("""
+    CREATE OR REPLACE VIEW ec2_ta_hotspots AS
+    SELECT
+      billing_period,
+      business_area,
+      region,
+      SUM(COALESCE(ta_est_savings,0) + COALESCE(ta_rightsize_savings,0)) AS total_savings,
+      RANK() OVER (PARTITION BY billing_period ORDER BY SUM(COALESCE(ta_est_savings,0) + COALESCE(ta_rightsize_savings,0)) DESC) AS rank_in_period
+    FROM ec2_ta_norm
+    GROUP BY 1,2,3
+    ORDER BY total_savings DESC;
+    """)
 
-# ---------------- EC2 TA Section ----------------
-st.subheader("EC2 (Trusted Advisor) — RI Opportunities")
-ec2_BAs     = distinct("BA", "ec2_reserved_recs")
-ec2_regions = distinct("region", "ec2_reserved_recs")
-ec2_plats   = distinct("platform", "ec2_reserved_recs")
-
-e1, e2, e3 = st.columns(3)
-ec2_sel_ba     = e1.selectbox("EC2: Business Unit (BA)", options=["(all)"] + ec2_BAs)
-ec2_sel_region = e2.selectbox("EC2: Region", options=["(all)"] + ec2_regions)
-ec2_sel_plat   = e3.selectbox("EC2: Platform", options=["(all)"] + ec2_plats)
-
-def ec2_where(base="1=1"):
-    wc = [base]
-    if ec2_sel_ba != "(all)":
-        wc.append(f"BA = '{ec2_sel_ba.replace(\"'\",\"''\")}'")
-    if ec2_sel_region != "(all)":
-        wc.append(f"region = '{ec2_sel_region.replace(\"'\",\"''\")}'")
-    if ec2_sel_plat != "(all)":
-        wc.append(f"platform = '{ec2_sel_plat.replace(\"'\",\"''\")}'")
-    return " AND ".join(wc)
-
-tabE1, tabE2, tabE3, tabE4, tabE5 = st.tabs([
-    "Ranked (ROI + Risk)", "By BA (coverage%)", "By Platform", "By Region", "Pareto Top"
-])
-
-with tabE1:
-    q = f"""
-    SELECT *
-    FROM ec2_ri_ranked
-    WHERE {ec2_where('1=1')}
-    ORDER BY savings_per_instance DESC NULLS LAST, est_monthly_savings_usd DESC NULLS LAST
-    LIMIT 500
-    """
-    st.caption(q)
-    st.dataframe(con.execute(q).fetchdf())
-    # Quick filters users often ask for:
-    st.markdown("**Quick filters:**")
-    colq1, colq2 = st.columns(2)
-    if colq1.button("High-Util ≥ 80% & ≤ 2 instances suggested"):
-        q2 = f"""
-        SELECT *
-        FROM ec2_ri_ranked
-        WHERE {ec2_where("1=1")} AND avg_util_6m >= 80 AND num_instances_to_purchase <= 2
-        ORDER BY est_monthly_savings_usd DESC NULLS LAST
-        LIMIT 200
-        """
-        st.caption(q2); st.dataframe(con.execute(q2).fetchdf())
-    if colq2.button("Purchase candidates (util ≥50% & $/inst ≥25)"):
-        q3 = f"""
-        SELECT *
-        FROM ec2_ri_ranked
-        WHERE {ec2_where("1=1")} AND avg_util_6m >= 50 AND savings_per_instance >= 25
-        ORDER BY savings_per_instance DESC NULLS LAST
-        LIMIT 200
-        """
-        st.caption(q3); st.dataframe(con.execute(q3).fetchdf())
-
-with tabE2:
-    q = f"SELECT * FROM ec2_ri_by_ba WHERE {ec2_where('1=1')} ORDER BY total_savings_usd DESC"
-    st.caption(q); st.dataframe(con.execute(q).fetchdf())
-
-with tabE3:
-    q = f"SELECT * FROM ec2_ri_by_platform WHERE {ec2_where('1=1')} ORDER BY total_savings_usd DESC NULLS LAST"
-    st.caption(q); st.dataframe(con.execute(q).fetchdf())
-
-with tabE4:
-    q = f"SELECT * FROM ec2_ri_by_region WHERE {ec2_where('1=1')} ORDER BY total_savings_usd DESC NULLS LAST"
-    st.caption(q); st.dataframe(con.execute(q).fetchdf())
-
-with tabE5:
-    q = f"SELECT * FROM ec2_ri_top_pareto WHERE {ec2_where('1=1')} ORDER BY est_monthly_savings_usd DESC NULLS LAST"
-    st.caption(q); st.dataframe(con.execute(q).fetchdf())
-
-st.divider()
-
-# Downloads
-c6, c7 = st.columns(2)
-with c6:
-    if st.button("⬇️ Download RDS Actions"):
-        df = con.execute(f"SELECT * FROM rds_actions_ranked WHERE {rds_where('1=1')}").fetchdf()
-        st.download_button("rds_actions_ranked.csv", data=df.to_csv(index=False), file_name="rds_actions_ranked.csv", mime="text/csv")
-with c7:
-    if st.button("⬇️ Download EC2 Ranked"):
-        df = con.execute(f"SELECT * FROM ec2_ri_ranked WHERE {ec2_where('1=1')}").fetchdf()
-        st.download_button("ec2_ri_ranked.csv", data=df.to_csv(index=False), file_name="ec2_ri_ranked.csv", mime="text/csv")
+# (optional quick run)
+if __name__ == "__main__":
+    con = duckdb.connect()
+    # n = load_ta_csv(con, "ec2_ta.csv"); print("rows:", n)
+    # create_views(con)
+    # print(con.execute("SELECT * FROM ec2_ta_actions_explain LIMIT 5").fetchdf())
