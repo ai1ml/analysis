@@ -269,3 +269,67 @@ def create_views(con):
     FROM ebs_actions_ranked r
     ORDER BY est_savings_usd DESC NULLS LAST, rank_in_period ASC;
     """)
+
+
+import streamlit as st
+
+def ebs_section(con):
+    st.header("EBS Analysis")
+
+    # Business Area filter
+    ebs_BAs = [r[0] for r in con.execute(
+        "SELECT DISTINCT business_area FROM ebs_norm ORDER BY 1"
+    ).fetchall()]
+    sel_ba = st.selectbox("Business Area", options=["(all)"] + ebs_BAs, key="ebs_ba")
+
+    # Simple WHERE builder
+    def ew(base="1=1"):
+        wc = [base]
+        if sel_ba != "(all)":
+            wc.append(f"business_area = '{sel_ba.replace(\"'\",\"''\")}'")
+        return " AND ".join(wc)
+
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+        "By BA", "By Region/Type", "Unattached", "Long Idle", 
+        "gp2→gp3", "standard→gp3", "HDD Review", "Actions Ranked"
+    ])
+
+    with tab1:
+        q = f"SELECT * FROM ebs_by_ba WHERE {ew()} ORDER BY total_cost_usd DESC"
+        st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
+
+    with tab2:
+        q = f"SELECT * FROM ebs_by_region_type WHERE {ew()} ORDER BY total_cost_usd DESC"
+        st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
+
+    with tab3:
+        q = f"SELECT * FROM ebs_unattached WHERE {ew()} ORDER BY public_cost_usd DESC"
+        st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
+
+    with tab4:
+        q = f"SELECT * FROM ebs_unattached_long_idle WHERE {ew()} ORDER BY confidence_level DESC, public_cost_usd DESC"
+        st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
+
+    with tab5:
+        q = f"SELECT * FROM ebs_gp2_to_gp3 WHERE {ew()} ORDER BY est_monthly_savings_usd DESC"
+        st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
+
+    with tab6:
+        q = f"SELECT * FROM ebs_standard_to_gp3 WHERE {ew()} ORDER BY est_monthly_savings_usd DESC"
+        st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
+
+    with tab7:
+        q = f"SELECT * FROM ebs_hdd_review WHERE {ew()} ORDER BY public_cost_usd DESC"
+        st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
+
+    with tab8:
+        q = f"SELECT * FROM ebs_actions_ranked WHERE {ew()} ORDER BY est_monthly_savings_usd DESC"
+        st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
