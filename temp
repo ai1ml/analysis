@@ -1,33 +1,137 @@
-# ---- defaults in one place ----
-def _ebs_defaults():
-    return {
-        "ebs_ba": "(all)",
-        "ebs_types": list(type_opts),                 # all selected by default
-        "ebs_attach": "All",
-        "ebs_days": (0, int(max(30, min(_max_days, 365)))),
-        "ebs_min_cost": 0.0,
-        "ebs_acct_search": "",
-    }
+import streamlit as st
 
-# ---- first-run init (before widgets) ----
-if "ebs_initialized" not in st.session_state:
-    st.session_state.update(_ebs_defaults())
-    st.session_state["ebs_initialized"] = True
+st.set_page_config(page_title="Cloud Savings — RDS + EC2 (MVP)", layout="wide")
+st.title("Cloud Savings — RDS + EC2 (MVP)")
 
-# ---- apply reset if flagged (before widgets) ----
-if st.session_state.get("_ebs_do_reset", False):
-    st.session_state.update(_ebs_defaults())
-    st.session_state["_ebs_do_reset"] = False
-    try:
-        st.rerun()                  # Streamlit ≥ 1.30
-    except Exception:
-        st.experimental_rerun()     # fallback
+# -------------------------------------------------------
+# 0) DB connection (assumes you already have `con`)
+# -------------------------------------------------------
+# from somewhere import con
+
+# -------------------------------------------------------
+# 1) Horizontal analysis selector (MAIN area)
+# -------------------------------------------------------
+ANALYSES = ["EBS", "EC2: OnDemand", "EC2: Reserved (RI)", "Snapshots", "RDS"]
+analysis = st.radio("Choose analysis", ANALYSES, horizontal=True, key="analysis_choice_main")
+st.write("")  # small spacer under selector
 
 
-# ---- Reset button sets a flag (no direct key writes here) ----
-if st.sidebar.button("Reset EBS Filters"):
-    st.session_state["_ebs_do_reset"] = True
-    try:
+# -------------------------------------------------------
+# 2) Sticky KPI strip (same place across analyses)
+# -------------------------------------------------------
+def kpi_strip(items):
+    """items = list of (label, value_str)"""
+    cols = st.columns(len(items))
+    for i, (label, val) in enumerate(items):
+        with cols[i]:
+            st.caption(label)
+            st.markdown(f"### {val}")
+
+# ---- KPI calculators (replace queries with your real ones)
+def ebs_kpis():
+    row = con.execute("""
+        SELECT
+          COUNT(*) AS volumes,
+          SUM(monthly_cost_usd) AS total_cost,
+          SUM(CASE WHEN attach_state='Detached' THEN monthly_cost_usd ELSE 0 END) AS unattached
+        FROM ebs_norm
+    """).fetchone()
+    return [
+        ("Volumes (filtered)", f"{int(row[0] or 0):,}"),
+        ("Total EBS $/mo",     f"${(row[1] or 0):,.2f}"),
+        ("Unattached $/mo",    f"${(row[2] or 0):,.2f}"),
+    ]
+
+def ec2_od_kpis():
+    r = con.execute("""
+        SELECT COUNT(*) AS inst, SUM(total_cost_usd) AS cost
+        FROM ec2_od_norm
+    """).fetchone() if "ec2_od_norm" in con.execute("SHOW TABLES").fetchdf().name.values else (0,0)
+    return [("Instances", f"{int((r[0] or 0)):,}"), ("On-Demand $/mo", f"${(r[1] or 0):,.2f}"), ("Savings opp.", "—")]
+
+def ec2_ri_kpis():
+    r = con.execute("""
+        SELECT COUNT(*) AS recs, SUM(estimated_savings_usd) AS sav
+        FROM ec2_ta_recommendations
+    """).fetchone() if "ec2_ta_recommendations" in con.execute("SHOW TABLES").fetchdf().name.values else (0,0)
+    return [("Recs (TA)", f"{int((r[0] or 0)):,}"), ("Est. Savings $/mo", f"${(r[1] or 0):,.2f}"), ("Coverage", "—")]
+
+def snaps_kpis():
+    r = con.execute("""
+        SELECT COUNT(*) AS snaps, SUM(public_cost_usd) AS cost
+        FROM snapshots_parsed
+    """).fetchone() if "snapshots_parsed" in con.execute("SHOW TABLES").fetchdf().name.values else (0,0)
+    return [("Snapshots", f"{int((r[0] or 0)):,}"), ("Total $/mo", f"${(r[1] or 0):,.2f}"), ("Archive opp.", "—")]
+
+def rds_kpis():
+    r = con.execute("""
+        SELECT COUNT(*) AS dbs, SUM(current_cost_usd) AS cost
+        FROM rds_usage
+    """).fetchone() if "rds_usage" in con.execute("SHOW TABLES").fetchdf().name.values else (0,0)
+    return [("DBs", f"{int((r[0] or 0)):,}"), ("Total $/mo", f"${(r[1] or 0):,.2f}"), ("Rightsize opp.", "—")]
+
+# Draw KPIs based on selected analysis
+if analysis == "EBS":
+    kpi_strip(ebs_kpis())
+elif analysis == "EC2: OnDemand":
+    kpi_strip(ec2_od_kpis())
+elif analysis == "EC2: Reserved (RI)":
+    kpi_strip(ec2_ri_kpis())
+elif analysis == "Snapshots":
+    kpi_strip(snaps_kpis())
+elif analysis == "RDS":
+    kpi_strip(rds_kpis())
+
+st.divider()
+
+
+# -------------------------------------------------------
+# 3) Routers into each analysis section
+#    (Put your existing code into these functions)
+# -------------------------------------------------------
+def render_ebs_section():
+    # >>> YOUR FINAL EBS BLOCK GOES HERE <<<
+    # (keep filters in the SIDEBAR; keep your 5 tabs; use hide_index=True)
+    # Example of using hide_index everywhere:
+    # st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
+    pass
+
+def render_ec2_ondemand_section():
+    # >>> Your EC2 OnDemand filters (sidebar) + tabs
+    pass
+
+def render_ec2_ta_section():
+    # >>> Your EC2 Trusted Advisor (RI) filters (sidebar) + tabs
+    pass
+
+def render_snapshots_section():
+    # >>> Your Snapshots filters (sidebar) + tabs
+    pass
+
+def render_rds_section():
+    # >>> Your RDS filters (sidebar) + tabs
+    pass
+
+
+# -------------------------------------------------------
+# 4) Optional: per-analysis reload buttons (no caching required)
+#     These just re-run the script; you can keep or remove them.
+# -------------------------------------------------------
+col_reload, _ = st.columns([1, 6])
+with col_reload:
+    if st.button(f"Reload {analysis}"):
         st.rerun()
-    except Exception:
-        st.experimental_rerun()
+
+# -------------------------------------------------------
+# 5) Show selected analysis body
+# -------------------------------------------------------
+if analysis == "EBS":
+    render_ebs_section()
+elif analysis == "EC2: OnDemand":
+    render_ec2_ondemand_section()
+elif analysis == "EC2: Reserved (RI)":
+    render_ec2_ta_section()
+elif analysis == "Snapshots":
+    render_snapshots_section()
+elif analysis == "RDS":
+    render_rds_section()
