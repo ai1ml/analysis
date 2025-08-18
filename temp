@@ -1,3 +1,8 @@
+# =========================
+# EBS Analysis (5 tabs)
+# =========================
+import streamlit as st
+
 st.markdown("## EBS Analysis")
 
 # --- helpers (safe to keep once globally) ---
@@ -47,6 +52,24 @@ _max_days = con.execute("SELECT COALESCE(MAX(days_since_last_attached),0) FROM e
 _max_cost = con.execute("SELECT COALESCE(MAX(monthly_cost_usd),0) FROM ebs_norm").fetchone()[0] or 0.0
 
 st.sidebar.subheader("Filters — EBS")
+
+# --- Reset button & defaults ---
+def _reset_ebs_filters():
+    st.session_state["ebs_ba"] = "(all)"
+    st.session_state["ebs_types"] = list(type_opts)          # all types selected
+    st.session_state["ebs_attach"] = "All"
+    st.session_state["ebs_days"] = (0, int(max(30, min(_max_days, 365))))
+    st.session_state["ebs_min_cost"] = 0.0
+    st.session_state["ebs_acct_search"] = ""
+
+if st.sidebar.button("Reset EBS Filters"):
+    _reset_ebs_filters()
+    try:
+        st.rerun()                  # Streamlit >= 1.30
+    except Exception:
+        st.experimental_rerun()     # older Streamlit fallback
+
+# --- widgets ---
 sel_ba     = st.sidebar.selectbox("Business Area", ba_opts, index=0, key="ebs_ba")
 sel_types  = st.sidebar.multiselect("Volume Type", type_opts, default=type_opts, key="ebs_types")
 sel_attach = st.sidebar.radio("Attachment", attach_opts, index=0, horizontal=True, key="ebs_attach")
