@@ -153,3 +153,23 @@ elif analysis == "Snapshots":
     render_snapshots_section()
 elif analysis == "RDS":
     render_rds_section()
+
+
+
+row1_left, row1_mid, row1_right = st.columns([3, 2, 2])
+
+with row1_left:
+    analysis = st.radio("Choose analysis", ANALYSES, horizontal=True, key="analysis_choice_main", label_visibility="collapsed")
+
+with row1_mid:
+    lr = st.session_state.last_refresh.get(analysis) or st.session_state.last_refresh.get("ALL")
+    st.caption(f"Last refreshed: {lr.strftime('%Y-%m-%d %H:%M:%S UTC') if lr else '—'}")
+
+with row1_right:
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🔄 Reload This", use_container_width=True):
+            reload_this_analysis()
+    with c2:
+        if st.button("♻️ Reload All", use_container_width=True):
+            reload_all()
