@@ -1,4 +1,5 @@
 import streamlit as st
+from datetime import datetime, timezone
 
 st.set_page_config(page_title="Cloud Savings — RDS + EC2 (MVP)", layout="wide")
 st.title("Cloud Savings — RDS + EC2 (MVP)")
@@ -13,11 +14,47 @@ st.title("Cloud Savings — RDS + EC2 (MVP)")
 # -------------------------------------------------------
 ANALYSES = ["EBS", "EC2: OnDemand", "EC2: Reserved (RI)", "Snapshots", "RDS"]
 analysis = st.radio("Choose analysis", ANALYSES, horizontal=True, key="analysis_choice_main")
-st.write("")  # small spacer under selector
-
+st.write("")  # small spacer
 
 # -------------------------------------------------------
-# 2) Sticky KPI strip (same place across analyses)
+# 2) Reload toolbar (top-right) + Last refreshed
+# -------------------------------------------------------
+if "last_refresh" not in st.session_state:
+    st.session_state.last_refresh = {}
+
+def _mark_refreshed(scope: str):
+    st.session_state.last_refresh[scope] = datetime.now(timezone.utc)
+
+def reload_this_analysis():
+    # If you start using @st.cache_data per-analysis loaders later,
+    # clear only that cache here. For now, just mark and rerun.
+    _mark_refreshed(analysis)
+    st.rerun()
+
+def reload_all():
+    # If you add caching later, uncomment:
+    # st.cache_data.clear()
+    # st.cache_resource.clear()
+    st.session_state.last_refresh = {}
+    _mark_refreshed("ALL")
+    st.rerun()
+
+t1, t2, t3 = st.columns([6, 1.2, 1.2])
+with t2:
+    if st.button("🔄 Reload This", use_container_width=True):
+        reload_this_analysis()
+with t3:
+    if st.button("♻️ Reload All", use_container_width=True):
+        reload_all()
+
+lr = st.session_state.last_refresh.get(analysis) or st.session_state.last_refresh.get("ALL")
+with t1:
+    st.caption(f"Last refreshed: {lr.strftime('%Y-%m-%d %H:%M:%S UTC') if lr else '—'}")
+
+st.divider()
+
+# -------------------------------------------------------
+# 3) Sticky KPI strip (uniform across analyses)
 # -------------------------------------------------------
 def kpi_strip(items):
     """items = list of (label, value_str)"""
@@ -27,15 +64,19 @@ def kpi_strip(items):
             st.caption(label)
             st.markdown(f"### {val}")
 
-# ---- KPI calculators (replace queries with your real ones)
+# ---- KPI calculators (stub queries; replace with your real ones)
 def ebs_kpis():
-    row = con.execute("""
-        SELECT
-          COUNT(*) AS volumes,
-          SUM(monthly_cost_usd) AS total_cost,
-          SUM(CASE WHEN attach_state='Detached' THEN monthly_cost_usd ELSE 0 END) AS unattached
-        FROM ebs_norm
-    """).fetchone()
+    # Example assumes ebs_norm exists
+    try:
+        row = con.execute("""
+            SELECT
+              COUNT(*) AS volumes,
+              SUM(monthly_cost_usd) AS total_cost,
+              SUM(CASE WHEN attach_state='Detached' THEN monthly_cost_usd ELSE 0 END) AS unattached
+            FROM ebs_norm
+        """).fetchone()
+    except Exception:
+        row = (0, 0.0, 0.0)
     return [
         ("Volumes (filtered)", f"{int(row[0] or 0):,}"),
         ("Total EBS $/mo",     f"${(row[1] or 0):,.2f}"),
@@ -43,32 +84,17 @@ def ebs_kpis():
     ]
 
 def ec2_od_kpis():
-    r = con.execute("""
-        SELECT COUNT(*) AS inst, SUM(total_cost_usd) AS cost
-        FROM ec2_od_norm
-    """).fetchone() if "ec2_od_norm" in con.execute("SHOW TABLES").fetchdf().name.values else (0,0)
-    return [("Instances", f"{int((r[0] or 0)):,}"), ("On-Demand $/mo", f"${(r[1] or 0):,.2f}"), ("Savings opp.", "—")]
+    # Replace with your ec2_od_norm query or leave as stubs
+    return [("Instances", "—"), ("On-Demand $/mo", "—"), ("Savings opp.", "—")]
 
 def ec2_ri_kpis():
-    r = con.execute("""
-        SELECT COUNT(*) AS recs, SUM(estimated_savings_usd) AS sav
-        FROM ec2_ta_recommendations
-    """).fetchone() if "ec2_ta_recommendations" in con.execute("SHOW TABLES").fetchdf().name.values else (0,0)
-    return [("Recs (TA)", f"{int((r[0] or 0)):,}"), ("Est. Savings $/mo", f"${(r[1] or 0):,.2f}"), ("Coverage", "—")]
+    return [("Recs (TA)", "—"), ("Est. Savings $/mo", "—"), ("Coverage", "—")]
 
 def snaps_kpis():
-    r = con.execute("""
-        SELECT COUNT(*) AS snaps, SUM(public_cost_usd) AS cost
-        FROM snapshots_parsed
-    """).fetchone() if "snapshots_parsed" in con.execute("SHOW TABLES").fetchdf().name.values else (0,0)
-    return [("Snapshots", f"{int((r[0] or 0)):,}"), ("Total $/mo", f"${(r[1] or 0):,.2f}"), ("Archive opp.", "—")]
+    return [("Snapshots", "—"), ("Total $/mo", "—"), ("Archive opp.", "—")]
 
 def rds_kpis():
-    r = con.execute("""
-        SELECT COUNT(*) AS dbs, SUM(current_cost_usd) AS cost
-        FROM rds_usage
-    """).fetchone() if "rds_usage" in con.execute("SHOW TABLES").fetchdf().name.values else (0,0)
-    return [("DBs", f"{int((r[0] or 0)):,}"), ("Total $/mo", f"${(r[1] or 0):,.2f}"), ("Rightsize opp.", "—")]
+    return [("DBs", "—"), ("Total $/mo", "—"), ("Rightsize opp.", "—")]
 
 # Draw KPIs based on selected analysis
 if analysis == "EBS":
@@ -84,43 +110,35 @@ elif analysis == "RDS":
 
 st.divider()
 
-
 # -------------------------------------------------------
-# 3) Routers into each analysis section
-#    (Put your existing code into these functions)
+# 4) Routers into each analysis section
+#    (Plug your existing code into these stubs)
 # -------------------------------------------------------
 def render_ebs_section():
-    # >>> YOUR FINAL EBS BLOCK GOES HERE <<<
-    # (keep filters in the SIDEBAR; keep your 5 tabs; use hide_index=True)
-    # Example of using hide_index everywhere:
-    # st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
+    """
+    >>> Paste your finalized EBS block here:
+        - Sidebar filters (BA, Type(s), Attached/Detached, Days range, Min cost, Account search)
+        - Reset filters (flag + pre-widget pattern)
+        - 5 tabs (Overview, Efficiency Opportunities, Idle & Unattached, Other Reviews, Actions)
+        - Use st.dataframe(..., hide_index=True, use_container_width=True)
+    """
     pass
 
 def render_ec2_ondemand_section():
-    # >>> Your EC2 OnDemand filters (sidebar) + tabs
+    """Your EC2 OnDemand filters + tabs go here."""
     pass
 
 def render_ec2_ta_section():
-    # >>> Your EC2 Trusted Advisor (RI) filters (sidebar) + tabs
+    """Your EC2 Trusted Advisor (RI) filters + tabs go here."""
     pass
 
 def render_snapshots_section():
-    # >>> Your Snapshots filters (sidebar) + tabs
+    """Your Snapshots filters + tabs go here."""
     pass
 
 def render_rds_section():
-    # >>> Your RDS filters (sidebar) + tabs
+    """Your RDS filters + tabs go here."""
     pass
-
-
-# -------------------------------------------------------
-# 4) Optional: per-analysis reload buttons (no caching required)
-#     These just re-run the script; you can keep or remove them.
-# -------------------------------------------------------
-col_reload, _ = st.columns([1, 6])
-with col_reload:
-    if st.button(f"Reload {analysis}"):
-        st.rerun()
 
 # -------------------------------------------------------
 # 5) Show selected analysis body
