@@ -1,110 +1,168 @@
-# =========================
-# EC2 Trusted Advisor (RI)
-# =========================
+st.markdown("## EBS Analysis")
 
-st.markdown("## EC2 Trusted Advisor (RI)")
-
-# ---- helpers (match your style) ----
-def _distinct(col, src="ec2_ta_norm"):
+# --- helpers (safe to keep once globally) ---
+def _distinct(col, src="ebs_norm"):
     try:
         rows = con.execute(f"SELECT DISTINCT {col} FROM {src} WHERE {col} IS NOT NULL ORDER BY 1").fetchall()
         return [r[0] for r in rows if r[0] is not None]
     except Exception:
         return []
 
-def sw_for_view(view_name, base="1=1"):
+def _q(x: str) -> str:
+    return str(x).replace("'", "''")
+
+def ebs_where_for_view(view_name: str, base: str = "1=1") -> str:
     cols = set(con.execute(f"SELECT * FROM {view_name} LIMIT 0").fetchdf().columns)
     wc = [base]
-    # use the same selection variables you already use elsewhere, or define here:
-    # ta_sel_date, ta_sel_ba, ta_sel_region, ta_sel_family, ta_sel_flavor
-    if "recommendation_date" in cols and ta_sel_date   != "(all)":
-        wc.append(f"recommendation_date = '{ta_sel_date.replace(\"'\",\"''\")}'")
-    if "business_area"       in cols and ta_sel_ba     != "(all)":
-        wc.append(f"business_area = '{ta_sel_ba.replace(\"'\",\"''\")}'")
-    if "region"              in cols and ta_sel_region != "(all)":
-        wc.append(f"region = '{ta_sel_region.replace(\"'\",\"''\")}'")
-    # views use "platform" for family rollups, "platform_flavor" for detailed variants
-    if "platform"            in cols and ta_sel_family != "(all)":
-        wc.append(f"platform = '{ta_sel_family.replace(\"'\",\"''\")}'")
-    if "platform_flavor"     in cols and ta_sel_flavor != "(all)":
-        wc.append(f"platform_flavor = '{ta_sel_flavor.replace(\"'\",\"''\")}'")
+    # filters defined below
+    if "business_area" in cols and sel_ba != "(all)":
+        wc.append(f"business_area = '{_q(sel_ba)}'")
+    if sel_types and len(sel_types) != len(type_opts):
+        if "volume_type" in cols:
+            wc.append(f"volume_type IN ({', '.join([f'''\'{_q(t)}\''' for t in sel_types])})")
+        elif "volume_type_norm" in cols:
+            wc.append(f"volume_type_norm IN ({', '.join([f'''\'{_q(t)}\''' for t in sel_types])})")
+    if sel_attach != "All":
+        if "attach_state" in cols:
+            wc.append(f"attach_state = '{_q(sel_attach)}'")
+        elif "volume_state" in cols:
+            wc.append("LOWER(volume_state) IN ('available','detached')" if sel_attach=="Detached"
+                      else "LOWER(volume_state) IN ('in use','in-use')")
+    if "days_since_last_attached" in cols:
+        wc.append(f"days_since_last_attached BETWEEN {int(days_low)} AND {int(days_high)}")
+    if "monthly_cost_usd" in cols:
+        wc.append(f"monthly_cost_usd >= {float(min_cost)}")
+    elif "total_cost_usd" in cols:
+        wc.append(f"total_cost_usd >= {float(min_cost)}")
+    if acct_query and "linked_account_id" in cols:
+        wc.append(f"CAST(linked_account_id AS VARCHAR) ILIKE '%{_q(acct_query)}%'")
     return " AND ".join(wc)
 
-# ---- filters row (compact, like your snapshots section) ----
-ta_dates    = ["(all)"] + _distinct("recommendation_date")
-ta_bas      = ["(all)"] + _distinct("business_area")
-ta_regions  = ["(all)"] + _distinct("region")
-ta_families = ["(all)"] + _distinct("platform_family")
-ta_flavors  = ["(all)"] + _distinct("platform_flavor")
+# --- sidebar filters (optimized for 1 month + many accounts) ---
+type_opts  = _distinct("volume_type_norm")
+ba_opts    = ["(all)"] + _distinct("business_area")
+attach_opts = ["All", "Attached", "Detached"]
 
-c1, c2, c3, c4, c5 = st.columns(5)
-with c1: ta_sel_date   = st.selectbox("Recommendation date", ta_dates,    key="ta_date")
-with c2: ta_sel_ba     = st.selectbox("Business Area",       ta_bas,      key="ta_ba")
-with c3: ta_sel_region = st.selectbox("Region",              ta_regions,  key="ta_region")
-with c4: ta_sel_family = st.selectbox("Platform (family)",   ta_families, key="ta_family")
-with c5: ta_sel_flavor = st.selectbox("Platform flavor",     ta_flavors,  key="ta_flavor")
+_max_days = con.execute("SELECT COALESCE(MAX(days_since_last_attached),0) FROM ebs_norm").fetchone()[0] or 0
+_max_cost = con.execute("SELECT COALESCE(MAX(monthly_cost_usd),0) FROM ebs_norm").fetchone()[0] or 0.0
 
-# ---- tabs (matching your naming style) ----
-tabT1, tabT2, tabT3, tabT4, tabT5 = st.tabs([
-    "Hotspots", "Rollup (Family)", "Rollup (Flavor)", "Recommendations", "Actions"
+st.sidebar.subheader("Filters — EBS")
+sel_ba     = st.sidebar.selectbox("Business Area", ba_opts, index=0, key="ebs_ba")
+sel_types  = st.sidebar.multiselect("Volume Type", type_opts, default=type_opts, key="ebs_types")
+sel_attach = st.sidebar.radio("Attachment", attach_opts, index=0, horizontal=True, key="ebs_attach")
+
+days_low, days_high = st.sidebar.slider(
+    "Days since last attachment (range)",
+    0, int(max(365, _max_days)), (0, int(max(30, min(_max_days, 365)))),
+    key="ebs_days"
+)
+min_cost = st.sidebar.slider(
+    "Min monthly cost (USD)",
+    0.0, float(max(1000.0, _max_cost)), 0.0, step=5.0, key="ebs_min_cost"
+)
+acct_query = st.sidebar.text_input("Linked Account contains (optional)", value="", key="ebs_acct_search")
+
+# --- metrics strip ---
+where_norm = ebs_where_for_view("ebs_norm")
+m = con.execute(f"""
+    SELECT
+      COUNT(*) AS volumes,
+      SUM(monthly_cost_usd) AS total_cost_usd,
+      SUM(CASE WHEN attach_state='Detached' THEN monthly_cost_usd ELSE 0 END) AS unattached_cost_usd
+    FROM ebs_norm
+    WHERE {where_norm}
+""").fetchone()
+mc1, mc2, mc3 = st.columns(3)
+mc1.metric("Volumes (filtered)", int(m[0] or 0))
+mc2.metric("Total EBS $/mo",     f"${(m[1] or 0):,.2f}")
+mc3.metric("Unattached $/mo",    f"${(m[2] or 0):,.2f}")
+
+# --- TABS: 5 groups instead of 10 ---
+tabA, tabB, tabC, tabD, tabE = st.tabs([
+    "Overview", "Efficiency Opportunities", "Idle & Unattached",
+    "Other Reviews", "Recommended Actions"
 ])
 
-with tabT1:
-    v = "ec2_ta_hotspots"
-    q = f"""
-    SELECT *
-    FROM {v}
-    WHERE {sw_for_view(v)}
-    ORDER BY total_savings_usd DESC NULLS LAST
-    LIMIT 500
-    """
-    st.caption(q.strip())
-    st.dataframe(con.execute(q).fetchdf())
+# 1) OVERVIEW
+with tabA:
+    st.subheader("Overview")
+    c1, c2 = st.columns(2)
 
-with tabT2:
-    v = "ec2_ta_by_ba_region_platform"
-    q = f"""
-    SELECT *
-    FROM {v}
-    WHERE {sw_for_view(v)}
-    ORDER BY total_ta_savings_usd DESC NULLS LAST, rec_instances DESC NULLS LAST
-    LIMIT 500
-    """
-    st.caption(q.strip())
-    st.dataframe(con.execute(q).fetchdf())
+    with c1:
+        v = "ebs_by_ba"
+        q = f"SELECT * FROM {v} WHERE {ebs_where_for_view(v)} ORDER BY total_cost_usd DESC"
+        st.caption("By BA"); st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
 
-with tabT3:
-    v = "ec2_ta_by_ba_region_flavor"
-    q = f"""
-    SELECT *
-    FROM {v}
-    WHERE {sw_for_view(v)}
-    ORDER BY total_ta_savings_usd DESC NULLS LAST, rec_instances DESC NULLS LAST
-    LIMIT 500
-    """
-    st.caption(q.strip())
-    st.dataframe(con.execute(q).fetchdf())
+    with c2:
+        v = "ebs_by_account_type"
+        q = f"SELECT * FROM {v} WHERE {ebs_where_for_view(v)} ORDER BY total_cost_usd DESC, total_usage_gb_mo DESC"
+        st.caption("By Account × Type"); st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
 
-with tabT4:
-    v = "ec2_ta_recommendations_detail"
-    q = f"""
-    SELECT *
-    FROM {v}
-    WHERE {sw_for_view(v)}
-    ORDER BY ta_est_savings_usd DESC NULLS LAST
-    LIMIT 500
-    """
-    st.caption(q.strip())
-    st.dataframe(con.execute(q).fetchdf())
+# 2) EFFICIENCY OPPORTUNITIES
+with tabB:
+    st.subheader("Efficiency Opportunities")
+    with st.expander("gp2 → gp3 (estimated savings)", expanded=True):
+        v = "ebs_gp2_to_gp3"
+        q = f"SELECT * FROM {v} WHERE {ebs_where_for_view(v)} ORDER BY est_monthly_savings_usd DESC NULLS LAST"
+        st.caption(q); st.dataframe(con.execute(q).fetchdf())
 
-with tabT5:
-    v = "ec2_ta_actions_explain"
-    q = f"""
-    SELECT *
-    FROM {v}
-    WHERE {sw_for_view(v)}
-    ORDER BY best_action_savings DESC NULLS LAST
-    LIMIT 500
-    """
-    st.caption(q.strip())
+    with st.expander("standard → gp3 (legacy magnetic)", expanded=False):
+        v = "ebs_standard_to_gp3"
+        q = f"SELECT * FROM {v} WHERE {ebs_where_for_view(v)} ORDER BY est_monthly_savings_usd DESC NULLS LAST"
+        st.caption(q); st.dataframe(con.execute(q).fetchdf())
+
+    with st.expander("io1 downgrade (low IOPS usage)", expanded=False):
+        v = "ebs_io1_downgrade"
+        q = f"SELECT * FROM {v} WHERE {ebs_where_for_view(v)} ORDER BY monthly_cost_usd DESC NULLS LAST"
+        st.caption(q); st.dataframe(con.execute(q).fetchdf())
+
+# 3) IDLE & UNATTACHED
+with tabC:
+    st.subheader("Idle & Unattached")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        v = "ebs_unattached"
+        q = f"SELECT * FROM {v} WHERE {ebs_where_for_view(v)} ORDER BY monthly_cost_usd DESC NULLS LAST, days_since_last_attached DESC NULLS LAST"
+        st.caption("Unattached volumes"); st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
+
+    with c2:
+        v = "ebs_unattached_long_idle"
+        q = f"""
+        SELECT *
+        FROM {v}
+        WHERE {ebs_where_for_view(v)}
+        ORDER BY
+          CASE confidence WHEN 'High' THEN 3 WHEN 'Medium' THEN 2 ELSE 1 END DESC,
+          monthly_cost_usd DESC NULLS LAST
+        """
+        st.caption("Long idle (with confidence)"); st.caption(q.strip())
+        st.dataframe(con.execute(q).fetchdf())
+
+# 4) OTHER REVIEWS
+with tabD:
+    st.subheader("Other Reviews")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        v = "ebs_hdd_review"
+        q = f"SELECT * FROM {v} WHERE {ebs_where_for_view(v)} ORDER BY monthly_cost_usd DESC NULLS LAST, usage_storage_gb_mo DESC NULLS LAST"
+        st.caption("HDD (sc1/st1) review"); st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
+
+    with c2:
+        v = "ebs_sprawl_clusters"
+        q = f"SELECT * FROM {v} WHERE {ebs_where_for_view(v)} ORDER BY volume_count DESC, total_cost_usd DESC"
+        st.caption("Sprawl clusters (BA × Account)"); st.caption(q)
+        st.dataframe(con.execute(q).fetchdf())
+
+# 5) RECOMMENDED ACTIONS
+with tabE:
+    st.subheader("Recommended Actions (ranked)")
+    v = "ebs_actions_explain"
+    q = f"SELECT * FROM {v} WHERE {ebs_where_for_view(v)} ORDER BY est_savings_usd DESC NULLS LAST, rank_in_period ASC"
+    st.caption(q)
     st.dataframe(con.execute(q).fetchdf())
