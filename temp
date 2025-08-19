@@ -1,190 +1,40 @@
 st.markdown("""
 <style>
-/* tighten top/bottom padding of the main container */
-.block-container { padding-top: 0.6rem; padding-bottom: 0.8rem; }
+/* Keep things compact but not clipped */
+.block-container { padding-top: 1.0rem; padding-bottom: 0.8rem; }
 
-/* reduce gaps inside horizontal blocks and columns */
-div[data-testid="stHorizontalBlock"] { gap: 0.4rem !important; }
-div[data-testid="column"] { padding-top: 0.1rem; padding-bottom: 0.1rem; }
+/* Tighten gaps between horizontal blocks/columns */
+div[data-testid="stHorizontalBlock"] { gap: 0.5rem !important; }
+div[data-testid="column"] { padding-top: 0.2rem; padding-bottom: 0.2rem; }
 
-/* make metrics a bit smaller */
-div[data-testid="stMetricValue"] { font-size: 1.25rem; }
+/* Headings spacing (avoid big margins under H1) */
+h1 { margin-bottom: 0.4rem; }
+
+/* Radio group spacing (keep label collapsed but reserve space) */
+div[role="radiogroup"] { margin-bottom: 0.2rem; }
+
+/* KPI sizing */
+div[data-testid="stMetricValue"] { font-size: 1.15rem; }
 div[data-testid="stMetricLabel"] { font-size: 0.80rem; color: #666; }
 </style>
 """, unsafe_allow_html=True)
 
-import streamlit as st
-from datetime import datetime, timezone
 
-st.set_page_config(page_title="Cloud Savings — RDS + EC2 (MVP)", layout="wide")
-st.title("Cloud Savings — RDS + EC2 (MVP)")
-
-# -------------------------------------------------------
-# 0) DB connection (assumes you already have `con`)
-# -------------------------------------------------------
-# from somewhere import con
-
-# -------------------------------------------------------
-# 1) Horizontal analysis selector (MAIN area)
-# -------------------------------------------------------
-ANALYSES = ["EBS", "EC2: OnDemand", "EC2: Reserved (RI)", "Snapshots", "RDS"]
-analysis = st.radio("Choose analysis", ANALYSES, horizontal=True, key="analysis_choice_main")
-st.write("")  # small spacer
-
-# -------------------------------------------------------
-# 2) Reload toolbar (top-right) + Last refreshed
-# -------------------------------------------------------
-if "last_refresh" not in st.session_state:
-    st.session_state.last_refresh = {}
-
-def _mark_refreshed(scope: str):
-    st.session_state.last_refresh[scope] = datetime.now(timezone.utc)
-
-def reload_this_analysis():
-    # If you start using @st.cache_data per-analysis loaders later,
-    # clear only that cache here. For now, just mark and rerun.
-    _mark_refreshed(analysis)
-    st.rerun()
-
-def reload_all():
-    # If you add caching later, uncomment:
-    # st.cache_data.clear()
-    # st.cache_resource.clear()
-    st.session_state.last_refresh = {}
-    _mark_refreshed("ALL")
-    st.rerun()
-
-t1, t2, t3 = st.columns([6, 1.2, 1.2])
-with t2:
-    if st.button("🔄 Reload This", use_container_width=True):
-        reload_this_analysis()
-with t3:
-    if st.button("♻️ Reload All", use_container_width=True):
-        reload_all()
-
-lr = st.session_state.last_refresh.get(analysis) or st.session_state.last_refresh.get("ALL")
-with t1:
-    st.caption(f"Last refreshed: {lr.strftime('%Y-%m-%d %H:%M:%S UTC') if lr else '—'}")
-
-st.divider()
-
-# -------------------------------------------------------
-# 3) Sticky KPI strip (uniform across analyses)
-# -------------------------------------------------------
 def kpi_strip(items):
-    """items = list of (label, value_str)"""
     cols = st.columns(len(items))
-    for i, (label, val) in enumerate(items):
-        with cols[i]:
-            st.caption(label)
-            st.markdown(f"### {val}")
+    for col, (label, val) in zip(cols, items):
+        with col:
+            st.metric(label=label, value=val)
 
-# ---- KPI calculators (stub queries; replace with your real ones)
-def ebs_kpis():
-    # Example assumes ebs_norm exists
-    try:
-        row = con.execute("""
-            SELECT
-              COUNT(*) AS volumes,
-              SUM(monthly_cost_usd) AS total_cost,
-              SUM(CASE WHEN attach_state='Detached' THEN monthly_cost_usd ELSE 0 END) AS unattached
-            FROM ebs_norm
-        """).fetchone()
-    except Exception:
-        row = (0, 0.0, 0.0)
-    return [
-        ("Volumes (filtered)", f"{int(row[0] or 0):,}"),
-        ("Total EBS $/mo",     f"${(row[1] or 0):,.2f}"),
-        ("Unattached $/mo",    f"${(row[2] or 0):,.2f}"),
-    ]
-
-def ec2_od_kpis():
-    # Replace with your ec2_od_norm query or leave as stubs
-    return [("Instances", "—"), ("On-Demand $/mo", "—"), ("Savings opp.", "—")]
-
-def ec2_ri_kpis():
-    return [("Recs (TA)", "—"), ("Est. Savings $/mo", "—"), ("Coverage", "—")]
-
-def snaps_kpis():
-    return [("Snapshots", "—"), ("Total $/mo", "—"), ("Archive opp.", "—")]
-
-def rds_kpis():
-    return [("DBs", "—"), ("Total $/mo", "—"), ("Rightsize opp.", "—")]
-
-# Draw KPIs based on selected analysis
-if analysis == "EBS":
-    kpi_strip(ebs_kpis())
-elif analysis == "EC2: OnDemand":
-    kpi_strip(ec2_od_kpis())
-elif analysis == "EC2: Reserved (RI)":
-    kpi_strip(ec2_ri_kpis())
-elif analysis == "Snapshots":
-    kpi_strip(snaps_kpis())
-elif analysis == "RDS":
-    kpi_strip(rds_kpis())
-
-st.divider()
-
-# -------------------------------------------------------
-# 4) Routers into each analysis section
-#    (Plug your existing code into these stubs)
-# -------------------------------------------------------
-def render_ebs_section():
-    """
-    >>> Paste your finalized EBS block here:
-        - Sidebar filters (BA, Type(s), Attached/Detached, Days range, Min cost, Account search)
-        - Reset filters (flag + pre-widget pattern)
-        - 5 tabs (Overview, Efficiency Opportunities, Idle & Unattached, Other Reviews, Actions)
-        - Use st.dataframe(..., hide_index=True, use_container_width=True)
-    """
-    pass
-
-def render_ec2_ondemand_section():
-    """Your EC2 OnDemand filters + tabs go here."""
-    pass
-
-def render_ec2_ta_section():
-    """Your EC2 Trusted Advisor (RI) filters + tabs go here."""
-    pass
-
-def render_snapshots_section():
-    """Your Snapshots filters + tabs go here."""
-    pass
-
-def render_rds_section():
-    """Your RDS filters + tabs go here."""
-    pass
-
-# -------------------------------------------------------
-# 5) Show selected analysis body
-# -------------------------------------------------------
-if analysis == "EBS":
-    render_ebs_section()
-elif analysis == "EC2: OnDemand":
-    render_ec2_ondemand_section()
-elif analysis == "EC2: Reserved (RI)":
-    render_ec2_ta_section()
-elif analysis == "Snapshots":
-    render_snapshots_section()
-elif analysis == "RDS":
-    render_rds_section()
+# ultra-thin divider under KPIs (optional)
+def thin_divider():
+    st.markdown("<hr style='margin:6px 0 4px 0; opacity:0.4;'>", unsafe_allow_html=True)
 
 
+kpi_strip(ebs_kpis() if analysis=="EBS" else
+          ec2_od_kpis() if analysis=="EC2: OnDemand" else
+          ec2_ri_kpis() if analysis=="EC2: Reserved (RI)" else
+          snaps_kpis()  if analysis=="Snapshots" else
+          rds_kpis())
 
-row1_left, row1_mid, row1_right = st.columns([3, 2, 2])
-
-with row1_left:
-    analysis = st.radio("Choose analysis", ANALYSES, horizontal=True, key="analysis_choice_main", label_visibility="collapsed")
-
-with row1_mid:
-    lr = st.session_state.last_refresh.get(analysis) or st.session_state.last_refresh.get("ALL")
-    st.caption(f"Last refreshed: {lr.strftime('%Y-%m-%d %H:%M:%S UTC') if lr else '—'}")
-
-with row1_right:
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("🔄 Reload This", use_container_width=True):
-            reload_this_analysis()
-    with c2:
-        if st.button("♻️ Reload All", use_container_width=True):
-            reload_all()
+thin_divider()
