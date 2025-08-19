@@ -1,91 +1,11 @@
-def _price_from_api(pricing_client, location: str, instance_class: str) -> Optional[float]:
+def refresh_prices_via_api(con):
     """
-    Robust RDS on-demand $/hr lookup. Tries multiple combinations to avoid empty results.
+    Optional: refresh only missing/stale prices via AWS Pricing API.
+    Assumes you already have the incremental seeder in rds_agent_setup.py.
     """
-    import re, json
-    m = re.match(r"^db\.([^.]+)\.(.+)$", instance_class.strip().lower())
-    if m:
-        instance_type = f"{m.group(1)}.{m.group(2)}"
-    else:
-        # already in r5.large form?
-        instance_type = instance_class.strip().lower()
-
-    # Try several permutations that appear in the catalog
-    deployments = ["Single-AZ", "Multi-AZ", "Multi-AZ (DB Instances)"]
-    engines     = ["Any", "MySQL", "PostgreSQL", "MariaDB", "Oracle", "SQL Server"]
-
-    def _search(filters):
-        paginator = pricing_client.get_paginator("get_products")
-        for page in paginator.paginate(ServiceCode="AmazonRDS", Filters=filters):
-            for raw in page.get("PriceList", []):
-                data = json.loads(raw)
-                terms = data.get("terms", {}).get("OnDemand", {})
-                for term in terms.values():
-                    for dim in term.get("priceDimensions", {}).values():
-                        usd = dim.get("pricePerUnit", {}).get("USD")
-                        if usd:
-                            try:
-                                val = float(usd)
-                                if val > 0:
-                                    return val
-                            except:
-                                pass
-        return None
-
-    base = [
-        {"Type":"TERM_MATCH","Field":"location","Value":location},
-        {"Type":"TERM_MATCH","Field":"instanceType","Value":instance_type},
-        {"Type":"TERM_MATCH","Field":"purchaseOption","Value":"OnDemand"},
-    ]
-
-    # 1) Strict attempt (with engine + preInstalledSw)
-    for d in deployments:
-        for e in engines:
-            f = base + [
-                {"Type":"TERM_MATCH","Field":"deploymentOption","Value":d},
-                {"Type":"TERM_MATCH","Field":"databaseEngine","Value":e},
-                {"Type":"TERM_MATCH","Field":"preInstalledSw","Value":"NA"},
-            ]
-            val = _search(f)
-            if val is not None:
-                return val
-
-    # 2) Loosen: drop preInstalledSw
-    for d in deployments:
-        for e in engines:
-            f = base + [
-                {"Type":"TERM_MATCH","Field":"deploymentOption","Value":d},
-                {"Type":"TERM_MATCH","Field":"databaseEngine","Value":e},
-            ]
-            val = _search(f)
-            if val is not None:
-                return val
-
-    # 3) Minimal: only location + instanceType
-    val = _search(base)
-    return val  # may be None
-
-
-
-def debug_one(pricing_client, location: str, instance_type: str):
-    import json
-    pages = pricing_client.get_paginator("get_products").paginate(
-        ServiceCode="AmazonRDS",
-        Filters=[
-            {"Type":"TERM_MATCH","Field":"location","Value":location},
-            {"Type":"TERM_MATCH","Field":"instanceType","Value":instance_type},
-        ],
-        MaxResults=5
-    )
-    for page in pages:
-        for raw in page.get("PriceList", []):
-            data = json.loads(raw)
-            print(json.dumps(data.get("product", {}).get("attributes", {}), indent=2))
-            return
-    print("No products found for", location, instance_type)
-
-
-
-
-pricing = _pricing_client()
-debug_one(pricing, "US East (N. Virginia)", "r5.large")
+    try:
+        from rds_agent_setup import seed_prices_incremental
+    except Exception:
+        # Fallback if you don’t have the incremental helper:
+        from rds_agent_setup import seed_prices_dynamic as seed_prices_incremental
+    seed_prices_incremental(con)  # will upsert into price_rds
