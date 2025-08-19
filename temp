@@ -1,98 +1,91 @@
-import streamlit as st
-from datetime import datetime, timezone
+def _price_from_api(pricing_client, location: str, instance_class: str) -> Optional[float]:
+    """
+    Robust RDS on-demand $/hr lookup. Tries multiple combinations to avoid empty results.
+    """
+    import re, json
+    m = re.match(r"^db\.([^.]+)\.(.+)$", instance_class.strip().lower())
+    if m:
+        instance_type = f"{m.group(1)}.{m.group(2)}"
+    else:
+        # already in r5.large form?
+        instance_type = instance_class.strip().lower()
 
-# ---------- page setup ----------
-st.set_page_config(page_title="Cloud Savings (MVP)", layout="wide")
-st.markdown("""
-<style>
-/* compact but not cramped */
-.block-container { padding-top: 1.0rem; padding-bottom: 0.8rem; }
-div[data-testid="stHorizontalBlock"] { gap: 0.5rem !important; }
-div[data-testid="column"] { padding-top: 0.15rem; padding-bottom: 0.15rem; }
-/* tidy H1 spacing */
-h1 { margin: 0 0 0.4rem 0; }
-/* KPI sizing */
-div[data-testid="stMetricValue"] { font-size: 1.15rem; }
-div[data-testid="stMetricLabel"] { font-size: 0.80rem; color: #666; }
-</style>
-""", unsafe_allow_html=True)
+    # Try several permutations that appear in the catalog
+    deployments = ["Single-AZ", "Multi-AZ", "Multi-AZ (DB Instances)"]
+    engines     = ["Any", "MySQL", "PostgreSQL", "MariaDB", "Oracle", "SQL Server"]
 
-st.title("Cloud Savings (MVP)")
+    def _search(filters):
+        paginator = pricing_client.get_paginator("get_products")
+        for page in paginator.paginate(ServiceCode="AmazonRDS", Filters=filters):
+            for raw in page.get("PriceList", []):
+                data = json.loads(raw)
+                terms = data.get("terms", {}).get("OnDemand", {})
+                for term in terms.values():
+                    for dim in term.get("priceDimensions", {}).values():
+                        usd = dim.get("pricePerUnit", {}).get("USD")
+                        if usd:
+                            try:
+                                val = float(usd)
+                                if val > 0:
+                                    return val
+                            except:
+                                pass
+        return None
 
-# ---------- analysis choices ----------
-ANALYSES = ["EBS", "EC2: OnDemand", "EC2: Reserved (RI)", "Snapshots", "RDS"]
+    base = [
+        {"Type":"TERM_MATCH","Field":"location","Value":location},
+        {"Type":"TERM_MATCH","Field":"instanceType","Value":instance_type},
+        {"Type":"TERM_MATCH","Field":"purchaseOption","Value":"OnDemand"},
+    ]
 
-# ---------- last refresh store ----------
-if "last_refresh" not in st.session_state:
-    st.session_state.last_refresh = {}
+    # 1) Strict attempt (with engine + preInstalledSw)
+    for d in deployments:
+        for e in engines:
+            f = base + [
+                {"Type":"TERM_MATCH","Field":"deploymentOption","Value":d},
+                {"Type":"TERM_MATCH","Field":"databaseEngine","Value":e},
+                {"Type":"TERM_MATCH","Field":"preInstalledSw","Value":"NA"},
+            ]
+            val = _search(f)
+            if val is not None:
+                return val
 
-def _mark_refreshed(scope: str):
-    st.session_state.last_refresh[scope] = datetime.now(timezone.utc)
+    # 2) Loosen: drop preInstalledSw
+    for d in deployments:
+        for e in engines:
+            f = base + [
+                {"Type":"TERM_MATCH","Field":"deploymentOption","Value":d},
+                {"Type":"TERM_MATCH","Field":"databaseEngine","Value":e},
+            ]
+            val = _search(f)
+            if val is not None:
+                return val
 
-# ---------- reload handlers (your real CSV loaders can be called inside) ----------
-def reload_this_analysis(analysis: str):
-    # if analysis == "EBS": load_ebs()  # <- re-import CSV + rebuild views
-    # elif analysis == "Snapshots": load_snapshots()
-    _mark_refreshed(analysis)
-    st.rerun()
+    # 3) Minimal: only location + instanceType
+    val = _search(base)
+    return val  # may be None
 
-def reload_all():
-    # load_ebs(); load_snapshots(); load_ec2_ondemand(); load_ec2_ta(); load_rds()
-    st.session_state.last_refresh = {}
-    _mark_refreshed("ALL")
-    st.rerun()
 
-# ---------- sidebar: nav + reload + timestamp + filters ----------
-st.sidebar.subheader("Analysis")
-analysis = st.sidebar.selectbox("Resource / analysis type", ANALYSES, index=0, key="analysis_choice_main")
 
-c1, c2 = st.sidebar.columns(2)
-with c1:
-    if st.button("🔄 Reload This", use_container_width=True):
-        reload_this_analysis(analysis)
-with c2:
-    if st.button("♻️ Reload All", use_container_width=True):
-        reload_all()
+def debug_one(pricing_client, location: str, instance_type: str):
+    import json
+    pages = pricing_client.get_paginator("get_products").paginate(
+        ServiceCode="AmazonRDS",
+        Filters=[
+            {"Type":"TERM_MATCH","Field":"location","Value":location},
+            {"Type":"TERM_MATCH","Field":"instanceType","Value":instance_type},
+        ],
+        MaxResults=5
+    )
+    for page in pages:
+        for raw in page.get("PriceList", []):
+            data = json.loads(raw)
+            print(json.dumps(data.get("product", {}).get("attributes", {}), indent=2))
+            return
+    print("No products found for", location, instance_type)
 
-lr = st.session_state.last_refresh.get(analysis) or st.session_state.last_refresh.get("ALL")
-st.sidebar.caption(f"Last refreshed: {lr.strftime('%Y-%m-%d %H:%M:%S UTC') if lr else '—'}")
 
-# per-analysis filters live here (example expander; put your widgets inside)
-with st.sidebar.expander("Filters", expanded=True):
-    # render_ebs_filters() / render_ec2_filters() ... based on `analysis`
-    pass
 
-# ---------- compact KPI strip ----------
-def kpi_strip(items):
-    cols = st.columns(len(items))
-    for col, (label, val) in zip(cols, items):
-        with col:
-            st.metric(label=label, value=val)
 
-# KPI calculators (replace with your real queries)
-def ebs_kpis():   return [("Volumes (filtered)","—"), ("Total EBS $/mo","—"), ("Unattached $/mo","—")]
-def ec2od_kpis(): return [("Instances","—"), ("On-Demand $/mo","—"), ("Savings opp.","—")]
-def ec2ri_kpis(): return [("Recs (TA)","—"), ("Est. Savings $/mo","—"), ("Coverage","—")]
-def snaps_kpis(): return [("Snapshots","—"), ("Total $/mo","—"), ("Archive opp.","—")]
-def rds_kpis():   return [("DBs","—"), ("Total $/mo","—"), ("Rightsize opp.","—")]
-
-if   analysis == "EBS":                 kpi_strip(ebs_kpis())
-elif analysis == "EC2: OnDemand":      kpi_strip(ec2od_kpis())
-elif analysis == "EC2: Reserved (RI)": kpi_strip(ec2ri_kpis())
-elif analysis == "Snapshots":           kpi_strip(snaps_kpis())
-elif analysis == "RDS":                 kpi_strip(rds_kpis())
-
-st.markdown("<hr style='margin:6px 0 6px 0; opacity:0.4;'>", unsafe_allow_html=True)
-
-# ---------- analysis body router ----------
-def render_ebs_section():        pass  # <- your tabs/tables; use st.dataframe(..., hide_index=True, use_container_width=True)
-def render_ec2_ondemand_section():pass
-def render_ec2_ta_section():      pass
-def render_snapshots_section():    pass
-def render_rds_section():          pass
-
-if   analysis == "EBS":                 render_ebs_section()
-elif analysis == "EC2: OnDemand":      render_ec2_ondemand_section()
-elif analysis == "EC2: Reserved (RI)": render_ec2_ta_section()
-elif analysis == "Snapshots":           render_snapshots_section()
-elif analysis == "RDS":                 render_rds_section()
+pricing = _pricing_client()
+debug_one(pricing, "US East (N. Virginia)", "r5.large")
