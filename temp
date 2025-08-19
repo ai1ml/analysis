@@ -1,3 +1,18 @@
+st.markdown("""
+<style>
+/* tighten top/bottom padding of the main container */
+.block-container { padding-top: 0.6rem; padding-bottom: 0.8rem; }
+
+/* reduce gaps inside horizontal blocks and columns */
+div[data-testid="stHorizontalBlock"] { gap: 0.4rem !important; }
+div[data-testid="column"] { padding-top: 0.1rem; padding-bottom: 0.1rem; }
+
+/* make metrics a bit smaller */
+div[data-testid="stMetricValue"] { font-size: 1.25rem; }
+div[data-testid="stMetricLabel"] { font-size: 0.80rem; color: #666; }
+</style>
+""", unsafe_allow_html=True)
+
 import streamlit as st
 from datetime import datetime, timezone
 
