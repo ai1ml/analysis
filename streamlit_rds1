@@ -1,0 +1,239 @@
+# =========================
+# RDS Analysis
+# =========================
+import streamlit as st
+
+st.markdown("## RDS Analysis")
+
+# --- API price button (top-right, one button only) ---
+b1, b2 = st.columns([6, 2])
+with b2:
+    if st.button("🔄 Update Prices (API)", use_container_width=True, key="rds_update_prices"):
+        from rds_views import refresh_prices_via_api  # or wherever you defined it
+        with st.status("Refreshing prices via AWS Pricing API…", expanded=True) as s:
+            refresh_prices_via_api(con)   # upserts into price_rds
+            s.update(label="Prices updated ✅", state="complete")
+        st.rerun()
+
+# --- helpers (safe to keep once globally) ---
+def _rds_q(x: str) -> str:
+    return str(x).replace("'", "''")
+
+def _rds_distinct(col, src="rds_clean"):
+    try:
+        rows = con.execute(f"SELECT DISTINCT {col} FROM {src} WHERE {col} IS NOT NULL ORDER BY 1").fetchall()
+        return [r[0] for r in rows if r[0] is not None]
+    except Exception:
+        return []
+
+def rds_where_for_view(view_name: str, base: str = "1=1") -> str:
+    cols = set(con.execute(f"SELECT * FROM {view_name} LIMIT 0").fetchdf().columns)
+    wc = [base]
+    # filters defined below (read from sidebar widget vars)
+    # BA
+    if "business_area" in cols and sel_ba != "(all)":
+        wc.append(f"business_area = '{_rds_q(sel_ba)}'")
+    # Region
+    if "region" in cols and sel_region != "(all)":
+        wc.append(f"region = '{_rds_q(sel_region)}'")
+    # Env (if view exposes env_guess = 'prod'/'nonprod')
+    if "env_guess" in cols and sel_env != "All":
+        wc.append(f"env_guess = '{_rds_q(sel_env.lower())}'")
+    # Instance family
+    if sel_fams and len(sel_fams) != len(fam_opts):
+        fam_list = ", ".join([f"'{_rds_q(f)}'" for f in sel_fams])
+        if "family" in cols:
+            wc.append(f"family IN ({fam_list})")
+        elif "current_class" in cols:
+            wc.append(f"REGEXP_EXTRACT(current_class, '^((db\\.[^.]+))\\..+$', 1) IN ({fam_list})")
+    # CPU
+    if "avg_cpu_14d" in cols:
+        wc.append(f"avg_cpu_14d BETWEEN {int(cpu_low)} AND {int(cpu_high)}")
+    # Hours (either 'hours' or 'current_hours')
+    if "hours" in cols:
+        wc.append(f"hours BETWEEN {int(hours_low)} AND {int(hours_high)}")
+    elif "current_hours" in cols:
+        wc.append(f"current_hours BETWEEN {int(hours_low)} AND {int(hours_high)}")
+    # Min cost
+    if "cost_usd" in cols:
+        wc.append(f"cost_usd >= {float(min_cost)}")
+    elif "current_cost_usd" in cols:
+        wc.append(f"current_cost_usd >= {float(min_cost)}")
+    elif "total_cost_usd" in cols:
+        wc.append(f"total_cost_usd >= {float(min_cost)}")
+    # Account search (optional)
+    if acct_query and "account_id" in cols:
+        wc.append(f"CAST(account_id AS VARCHAR) ILIKE '%{_rds_q(acct_query)}%'")
+    return " AND ".join(wc)
+
+# --- sidebar filters (SAME FORMAT as your EBS block) ---
+ba_opts     = ["(all)"] + _rds_distinct("business_area", "rds_clean")
+region_opts = ["(all)"] + _rds_distinct("region", "rds_clean")
+
+# prefer family from rds_with_size; else derive from class
+fam_opts = _rds_distinct("family", "rds_with_size")
+if not fam_opts:
+    try:
+        fam_opts = sorted(set([
+            r[0] for r in con.execute("""
+                SELECT DISTINCT REGEXP_EXTRACT(current_class, '^((db\\.[^.]+))\\..+$', 1) AS fam
+                FROM rds_clean WHERE current_class IS NOT NULL
+            """).fetchall() if r and r[0]
+        ]))
+    except Exception:
+        fam_opts = []
+
+_max_cpu   = int(con.execute("SELECT COALESCE(CEIL(MAX(avg_cpu_14d)),100) FROM rds_clean").fetchone()[0] or 100)
+_max_hours = int(con.execute("SELECT COALESCE(CEIL(MAX(hours)),0) FROM rds_clean").fetchone()[0] or 0)
+_max_cost  = float(con.execute("SELECT COALESCE(MAX(cost_usd),0) FROM rds_clean").fetchone()[0] or 0.0)
+
+st.sidebar.subheader("Filters — RDS")
+sel_ba     = st.sidebar.selectbox("Business Area", ba_opts, index=0, key="rds_ba")
+sel_region = st.sidebar.selectbox("Region",        region_opts, index=0, key="rds_region")
+sel_env    = st.sidebar.radio("Environment", ["All", "prod", "nonprod"], index=0, horizontal=True, key="rds_env")
+sel_fams   = st.sidebar.multiselect("Instance Family (db.*)", fam_opts, default=fam_opts, key="rds_families")
+
+cpu_low, cpu_high = st.sidebar.slider(
+    "CPU (avg 14d, %)",
+    0, 100, (0, min(100, _max_cpu)),
+    key="rds_cpu"
+)
+hours_low, hours_high = st.sidebar.slider(
+    "Hours in month",
+    0, max(720, _max_hours), (0, max(720, _max_hours)),
+    key="rds_hours"
+)
+min_cost = st.sidebar.slider(
+    "Min monthly cost (USD)",
+    0.0, float(max(1000.0, _max_cost)), 0.0, step=5.0, key="rds_min_cost"
+)
+acct_query = st.sidebar.text_input("Account ID contains (optional)", value="", key="rds_acct_search")
+
+# --- metrics strip (mirrors EBS style) ---
+where_clean = rds_where_for_view("rds_clean")
+m = con.execute(f"""
+    SELECT
+      COUNT(*) AS dbs,
+      SUM(cost_usd) AS total_cost_usd,
+      SUM(CASE WHEN avg_cpu_14d < 5 THEN cost_usd ELSE 0 END) AS near_idle_cost_usd
+    FROM rds_clean
+    WHERE {where_clean}
+""").fetchone()
+mc1, mc2, mc3 = st.columns(3)
+mc1.metric("DBs (filtered)",      int(m[0] or 0))
+mc2.metric("Total RDS $/mo",      f"${(m[1] or 0):,.2f}")
+mc3.metric("Near-idle $/mo (<5%)",f"${(m[2] or 0):,.2f}")
+
+# --- TABS: 5 groups mirroring EBS ---
+tabA, tabB, tabC, tabD, tabE = st.tabs([
+    "Overview", "Rightsizing", "Scheduling", "Utilization", "Recommended Actions"
+])
+
+# 1) OVERVIEW
+with tabA:
+    st.subheader("Overview")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        v = "rds_by_ba_region"
+        q = f"SELECT * FROM {v} WHERE {rds_where_for_view(v)} ORDER BY total_cost_usd DESC"
+        st.caption("By BA × Region"); st.caption(q)
+        st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
+
+    with c2:
+        v = "rds_by_class"
+        q = f"SELECT * FROM {v} WHERE {rds_where_for_view(v)} ORDER BY total_cost_usd DESC"
+        st.caption("By Class (family.size)"); st.caption(q)
+        st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
+
+# 2) RIGHTSIZING
+with tabB:
+    st.subheader("Rightsizing")
+    c1, c2 = st.tabs(["Downsize (CPU 5–10%)", "Upsize (CPU ≥90%)"])
+
+    with c1:
+        v = "rds_rightsize_next_smaller_priced"
+        q = f"""
+        SELECT business_area, region, db_id, current_class, recommended_class,
+               hours, cost_usd, avg_cpu_14d, est_monthly_savings_usd
+        FROM {v}
+        WHERE {rds_where_for_view(v)}
+        ORDER BY est_monthly_savings_usd DESC NULLS LAST
+        LIMIT 1000
+        """
+        st.caption(q.strip())
+        st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
+
+    with c2:
+        v = "rds_rightsize_next_larger_priced"
+        q = f"""
+        SELECT business_area, region, db_id, current_class, recommended_class,
+               hours, cost_usd, avg_cpu_14d, est_monthly_delta_usd
+        FROM {v}
+        WHERE {rds_where_for_view(v)}
+        ORDER BY est_monthly_delta_usd DESC NULLS LAST, avg_cpu_14d DESC
+        LIMIT 1000
+        """
+        st.caption(q.strip())
+        st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
+
+# 3) SCHEDULING (off-hours)
+with tabC:
+    st.subheader("Scheduling")
+    v = "rds_offhours_candidates"
+    q = f"""
+    SELECT business_area, region, db_id, current_class, env_guess,
+           current_hours, current_cost_usd, est_monthly_savings_usd
+    FROM {v}
+    WHERE {rds_where_for_view(v)}
+    ORDER BY est_monthly_savings_usd DESC
+    LIMIT 1000
+    """
+    st.caption(q.strip())
+    st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
+
+# 4) UTILIZATION
+with tabD:
+    st.subheader("Utilization")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        v = "rds_kill_merge"
+        q = f"""
+        SELECT business_area, region, db_id, current_class,
+               avg_cpu_14d, hours, cost_usd, est_monthly_savings_usd, confidence, reason
+        FROM {v}
+        WHERE {rds_where_for_view(v)}
+        ORDER BY est_monthly_savings_usd DESC NULLS LAST, cost_usd DESC NULLS LAST
+        LIMIT 1000
+        """
+        st.caption("Kill/Merge (CPU < 5%)"); st.caption(q.strip())
+        st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
+
+    with c2:
+        v = "rds_high_utilization"
+        q = f"""
+        SELECT business_area, region, db_id, current_class,
+               avg_cpu_14d, hours, cost_usd
+        FROM {v}
+        WHERE {rds_where_for_view(v)}
+        ORDER BY avg_cpu_14d DESC, cost_usd DESC
+        LIMIT 1000
+        """
+        st.caption("Hot DBs (CPU ≥ 90%)"); st.caption(q.strip())
+        st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
+
+# 5) RECOMMENDED ACTIONS
+with tabE:
+    st.subheader("Recommended Actions (ranked)")
+    v = "rds_actions_ranked"
+    q = f"""
+    SELECT action, business_area, region, db_id, current_class,
+           est_delta_usd, avg_cpu_14d, hours, cost_usd, reason, confidence
+    FROM {v}
+    WHERE {rds_where_for_view(v)}
+    ORDER BY priority DESC, est_delta_usd DESC NULLS LAST, cost_usd DESC NULLS LAST
+    LIMIT 2000
+    """
+    st.caption(q.strip())
+    st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
