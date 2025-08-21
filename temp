@@ -1,15 +1,22 @@
-# =========================
-# EC2 OnDemand — filters + tabs wired to your ec2_ops_setup.py views
-# =========================
+# ============================================
+# EC2 — On-Demand (with AWS Category Filter)
+# ============================================
 import streamlit as st
 
+# Assumes you already created a DuckDB connection named `con`
+
+# -----------------------
+# Helpers
+# -----------------------
 def _q(x: str) -> str:
     return str(x).replace("'", "''")
 
-def _ec2_distinct(col, src="ec2_od_norm"):
+def _distinct(col: str, src: str = "ec2_od_norm"):
     try:
-        rows = con.execute(f"SELECT DISTINCT {col} FROM {src} WHERE {col} IS NOT NULL ORDER BY 1").fetchall()
-        return [r[0] for r in rows if r[0] is not None]
+        rows = con.execute(
+            f"SELECT DISTINCT {col} FROM {src} WHERE {col} IS NOT NULL ORDER BY 1"
+        ).fetchall()
+        return [r[0] for r in rows if r and r[0] is not None]
     except Exception:
         return []
 
@@ -26,88 +33,149 @@ def pick_view(candidates):
             return v
     return None
 
-# ---------- Sidebar filters (aligned with your CSV columns) ----------
-st.sidebar.subheader("Filters — EC2 OnDemand")
+# Map instance family prefix to AWS category
+def _ec2_category_from_prefix(prefix: str) -> str:
+    p = (prefix or "").lower()
+    if p.startswith(("t", "m", "a")):                     # t*, m*, a*
+        return "General Purpose"
+    if p.startswith(("c",)):                              # c*
+        return "Compute Optimized"
+    if p.startswith(("r", "x", "z", "u")):                # r*, x*, z*, u*
+        return "Memory Optimized"
+    if p.startswith(("i", "d", "h")):                     # i*, d*, h*
+        return "Storage Optimized"
+    if p.startswith(("g", "p", "f", "inf", "trn")):       # g*, p*, f*, inf*, trn*
+        return "Accelerated Computing"
+    return "Other"
 
-# Business Area
-ba_opts = ["(all)"] + _ec2_distinct("business_area")
-sel_ba = st.sidebar.selectbox("Business Area", ba_opts, index=0, key="ec2_ba")
+# -----------------------
+# Discover columns present
+# -----------------------
+cols = set(con.execute("SELECT * FROM ec2_od_norm LIMIT 0").fetchdf().columns)
 
-# Purchase option (OnDemand / Spot)
-po_opts = ["(all)"] + [p for p in _ec2_distinct("purchase_option") if p]
-sel_po = st.sidebar.selectbox("Purchase option", po_opts, index=0, key="ec2_po")
+# -----------------------
+# Sidebar Filters (column-aware)
+# -----------------------
+st.markdown("## EC2 — On-Demand Analysis")
 
-# Family (derived if not present in the view)
-fam_opts = ["(all)"]
-try:
-    fam_opts = ["(all)"] + [f for f in _ec2_distinct("family") if f]
-except Exception:
-    pass
-sel_family = st.sidebar.selectbox("Instance family", fam_opts, index=0, key="ec2_family")
+st.sidebar.subheader("Filters — EC2 On-Demand")
 
-# CPU & Hours & Min Cost sliders (robust to column names)
-data_max_cpu = con.execute("""
-    SELECT COALESCE(MAX(COALESCE(avg_cpu_14d, fourteendayaveragecpuutilization)), 0) FROM ec2_od_norm
-""").fetchone()[0] or 0
-data_max_hours = con.execute("""
-    SELECT COALESCE(MAX(COALESCE(hours, usage_quantity_hours, usage_quantity)), 0) FROM ec2_od_norm
-""").fetchone()[0] or 0
-data_max_cost = con.execute("""
-    SELECT COALESCE(MAX(COALESCE(cost_usd, total_cost)), 0) FROM ec2_od_norm
-""").fetchone()[0] or 0
+# BA
+sel_ba = "(all)"
+if "ba" in cols:
+    ba_opts = ["(all)"] + _distinct("ba")
+    sel_ba = st.sidebar.selectbox("Business Area", ba_opts, index=0, key="ec2_ba")
 
-cpu_low, cpu_high   = st.sidebar.slider("CPU (avg 14d, %)", 0, 100, (0, min(100, int(data_max_cpu or 100))), key="ec2_cpu")
-hours_low, hours_high = st.sidebar.slider("Hours in month", 0, max(720, int(data_max_hours or 0)),
-                                         (0, max(160, min(720, int(data_max_hours or 720)))), key="ec2_hours")
-min_cost = st.sidebar.slider("Min monthly cost (USD)", 0.0, float(max(1000.0, data_max_cost or 0.0)),
-                             0.0, step=5.0, key="ec2_min_cost")
+# Region
+sel_regions, region_opts = [], []
+if "region" in cols:
+    region_opts = _distinct("region")
+    sel_regions = st.sidebar.multiselect("Region", region_opts, default=region_opts, key="ec2_regions")
 
-acct_query = st.sidebar.text_input("Linked Account contains (optional)", value="", key="ec2_acct_search")
+# Purchase option
+sel_purch, purch_opts = [], []
+if "purchase_option" in cols:
+    purch_opts = _distinct("purchase_option")
+    sel_purch = st.sidebar.multiselect("Purchase option", purch_opts, default=purch_opts, key="ec2_purch")
 
-# ---------- WHERE builder that only uses columns present in the target view ----------
+# ----- Category filter (derived from current_instance_type) -----
+sel_categories, present_categories, prefixes = [], [], []
+if "current_instance_type" in cols:
+    prefix_rows = con.execute("""
+        SELECT DISTINCT REGEXP_EXTRACT(current_instance_type, '^([a-z0-9]+)\\..+$', 1) AS fam
+        FROM ec2_od_norm
+        WHERE current_instance_type IS NOT NULL
+    """).fetchall()
+    prefixes = sorted({r[0] for r in prefix_rows if r and r[0]})
+    present_categories = sorted({_ec2_category_from_prefix(p) for p in prefixes})
+    sel_categories = st.sidebar.multiselect(
+        "Instance category",
+        present_categories,
+        default=present_categories,
+        key="ec2_categories",
+        help="High-level AWS groups (General/Compute/Memory/Storage/Accelerated)"
+    )
+
+# CPU slider
+cpu_low, cpu_high, cpu_col = 0, 100, None
+if "avg_cpu_14d" in cols:
+    cpu_col = "avg_cpu_14d"
+    cpu_low, cpu_high = st.sidebar.slider("CPU (avg 14d, %)", 0, 100, (0, 100), key="ec2_cpu")
+
+# Hours slider
+hours_low, hours_high, hours_col = 0, 0, None
+for c in ("usage_quantity", "hours", "usage_quantity_hours"):
+    if c in cols:
+        hours_col = c
+        break
+if hours_col:
+    max_hours = int(con.execute(f"SELECT COALESCE(CEIL(MAX({hours_col})),0) FROM ec2_od_norm").fetchone()[0] or 0)
+    hours_low, hours_high = st.sidebar.slider(
+        "Hours in month",
+        0, max(720, max_hours),
+        (0, max(720, max_hours)),
+        key="ec2_hours"
+    )
+
+# Min cost
+min_cost, cost_col = 0.0, None
+for c in ("cost_usd", "total_cost_usd"):
+    if c in cols:
+        cost_col = c
+        break
+if cost_col:
+    max_cost = float(con.execute(f"SELECT COALESCE(MAX({cost_col}),0) FROM ec2_od_norm").fetchone()[0] or 0.0)
+    min_cost = st.sidebar.slider(
+        "Min monthly cost (USD)",
+        0.0, float(max(1000.0, max_cost)),
+        0.0, step=5.0, key="ec2_min_cost"
+    )
+
+# Account search
+acct_query, acct_col = "", None
+for c in ("account_id", "linked_account_id"):
+    if c in cols:
+        acct_col = c
+        break
+if acct_col:
+    acct_query = st.sidebar.text_input("Account contains (optional)", value="", key="ec2_acct_search")
+
+# -----------------------
+# WHERE builder
+# -----------------------
 def ec2_where_for_view(view_name: str, base: str = "1=1") -> str:
-    cols = set(con.execute(f"SELECT * FROM {view_name} LIMIT 0").fetchdf().columns)
+    vcols = set(con.execute(f"SELECT * FROM {view_name} LIMIT 0").fetchdf().columns)
     wc = [base]
 
-    if "business_area" in cols and sel_ba != "(all)":
-        wc.append(f"business_area = '{_q(sel_ba)}'")
+    if "ba" in vcols and sel_ba != "(all)":
+        wc.append(f"ba = '{_q(sel_ba)}'")
 
-    if "purchase_option" in cols and sel_po != "(all)":
-        wc.append(f"LOWER(purchase_option) = LOWER('{_q(sel_po)}')")
+    if "region" in vcols and sel_regions and len(sel_regions) != len(region_opts):
+        wc.append("region IN (" + ", ".join([f"'{_q(r)}'" for r in sel_regions]) + ")")
 
-    # family — if not present, we’ll filter by regex on instance_type when available
-    if sel_family != "(all)":
-        if "family" in cols:
-            wc.append(f"family = '{_q(sel_family)}'")
-        elif "current_instance_type" in cols:
-            wc.append(f"REGEXP_EXTRACT(current_instance_type, '^([a-z0-9]+)\\..+$', 1) = '{_q(sel_family)}'")
+    if "purchase_option" in vcols and sel_purch and len(sel_purch) != len(purch_opts):
+        wc.append("purchase_option IN (" + ", ".join([f"'{_q(p)}'" for p in sel_purch]) + ")")
 
-    # CPU
-    if "avg_cpu_14d" in cols:
-        wc.append(f"avg_cpu_14d BETWEEN {int(cpu_low)} AND {int(cpu_high)}")
-    elif "fourteendayaveragecpuutilization" in cols:
-        wc.append(f"fourteendayaveragecpuutilization BETWEEN {int(cpu_low)} AND {int(cpu_high)}")
+    # category → allowed prefixes → predicate on current_instance_type
+    if "current_instance_type" in vcols and prefixes and present_categories and sel_categories and len(sel_categories) != len(present_categories):
+        allowed_prefixes = [p for p in prefixes if _ec2_category_from_prefix(p) in sel_categories]
+        if allowed_prefixes:
+            flist = ", ".join([f"'{_q(p)}'" for p in allowed_prefixes])
+            wc.append(f"REGEXP_EXTRACT(current_instance_type, '^([a-z0-9]+)\\..+$', 1) IN ({flist})")
+        else:
+            wc.append("1=0")  # nothing selected
 
-    # Hours
-    if "hours" in cols:
-        wc.append(f"hours BETWEEN {int(hours_low)} AND {int(hours_high)}")
-    elif "usage_quantity_hours" in cols:
-        wc.append(f"usage_quantity_hours BETWEEN {int(hours_low)} AND {int(hours_high)}")
-    elif "usage_quantity" in cols:
-        wc.append(f"usage_quantity BETWEEN {int(hours_low)} AND {int(hours_high)}")
+    if cpu_col and cpu_col in vcols:
+        wc.append(f"{cpu_col} BETWEEN {int(cpu_low)} AND {int(cpu_high)}")
 
-    # Cost
-    if "cost_usd" in cols:
-        wc.append(f"cost_usd >= {float(min_cost)}")
-    elif "total_cost" in cols:
-        wc.append(f"total_cost >= {float(min_cost)}")
+    if hours_col and hours_col in vcols:
+        wc.append(f"{hours_col} BETWEEN {int(hours_low)} AND {int(hours_high)}")
 
-    # Account search
-    if acct_query:
-        for col in ("linked_account_id", "account_id"):
-            if col in cols:
-                wc.append(f"CAST({col} AS VARCHAR) ILIKE '%{_q(acct_query)}%'")
-                break
+    if cost_col and cost_col in vcols:
+        wc.append(f"{cost_col} >= {float(min_cost)}")
+
+    if acct_query and acct_col and acct_col in vcols:
+        wc.append(f"CAST({acct_col} AS VARCHAR) ILIKE '%{_q(acct_query)}%'")
 
     return " AND ".join(wc)
 
@@ -117,78 +185,118 @@ def _show_q(q: str, title: str = None):
     st.caption(q)
     st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
 
-# ---------- Tabs (wired to actual/fallback view names) ----------
+# -----------------------
+# KPI strip
+# -----------------------
+metric_cost = cost_col or "0"
+metric_hours = hours_col or "0"
+where_norm = ec2_where_for_view("ec2_od_norm")
+m = con.execute(f"""
+    SELECT
+      COUNT(*) AS instances,
+      SUM({metric_cost}) AS total_cost_usd,
+      SUM(CASE WHEN {metric_hours} >= 24*28 THEN 1 ELSE 0 END) AS approx_24x7
+    FROM ec2_od_norm
+    WHERE {where_norm}
+""").fetchone()
+k1, k2, k3 = st.columns(3)
+k1.metric("Instances (filtered)", int(m[0] or 0))
+k2.metric("Total On-Demand $/mo", f"${(m[1] or 0):,.2f}" if cost_col else "—")
+k3.metric("~24×7 count", int(m[2] or 0) if hours_col else 0)
+
+# -----------------------
+# Tabs (EBS-style)
+# -----------------------
 tabA, tabB, tabC, tabD = st.tabs([
-    "Overview", "Savings Opportunities", "Utilization", "Recommended Actions"
+    "Overview", "Efficiency Opportunities", "Utilization", "Recommended Actions"
 ])
 
-# 1) Overview
+# 1) OVERVIEW
 with tabA:
     c1, c2 = st.columns(2)
-    # BA × Region (fallback to BA or Region)
-    v = pick_view(["ec2_od_by_ba_region", "ec2_od_by_ba", "ec2_od_by_region"])
+
+    v = pick_view(["ec2_od_by_ba_region", "ec2_ops_by_ba_region"])
     if v:
-        q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY COALESCE(total_cost_usd, total_cost) DESC"
-        label = "By BA × Region" if v == "ec2_od_by_ba_region" else ("By Business Area" if v == "ec2_od_by_ba" else "By Region")
-        _show_q(q, title=label)
-    # Family rollup (if you created one)
+        q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY COALESCE(total_cost_usd, 0) DESC NULLS LAST"
+        _show_q(q, title="By BA × Region")
+
+    # Category roll-up (derived on the fly, uses same filters via subquery)
     with c2:
-        v2 = pick_view(["ec2_od_by_family", "ec2_od_family_rollup"])
-        if v2:
-            q2 = f"SELECT * FROM {v2} WHERE {ec2_where_for_view(v2)} ORDER BY COALESCE(total_cost_usd, total_cost) DESC"
-            _show_q(q2, title="By Instance Family")
+        st.subheader("By Category", divider=False)
+        q_cat = f"""
+        WITH base AS (
+          SELECT *
+          FROM ec2_od_norm
+          WHERE {where_norm}
+        ),
+        fam AS (
+          SELECT
+            REGEXP_EXTRACT(current_instance_type, '^([a-z0-9]+)\\..+$', 1) AS prefix,
+            COALESCE({metric_cost}, 0) AS cost_usd
+          FROM base
+          WHERE current_instance_type IS NOT NULL
+        )
+        SELECT
+          CASE
+            WHEN prefix GLOB 't*' OR prefix GLOB 'm*' OR prefix GLOB 'a*' THEN 'General Purpose'
+            WHEN prefix GLOB 'c*' THEN 'Compute Optimized'
+            WHEN prefix GLOB 'r*' OR prefix GLOB 'x*' OR prefix GLOB 'z*' OR prefix GLOB 'u*' THEN 'Memory Optimized'
+            WHEN prefix GLOB 'i*' OR prefix GLOB 'd*' OR prefix GLOB 'h*' THEN 'Storage Optimized'
+            WHEN prefix GLOB 'g*' OR prefix GLOB 'p*' OR prefix GLOB 'f*' OR prefix GLOB 'inf*' OR prefix GLOB 'trn*'
+              THEN 'Accelerated Computing'
+            ELSE 'Other'
+          END AS category,
+          COUNT(*) AS instances,
+          SUM(cost_usd) AS total_cost_usd
+        FROM fam
+        GROUP BY 1
+        ORDER BY total_cost_usd DESC, instances DESC;
+        """
+        _show_q(q_cat)
 
-# 2) Savings Opportunities
+# 2) EFFICIENCY OPPORTUNITIES
 with tabB:
-    # Off-hours candidates (non-prod 24×7)
-    v = pick_view(["ec2_od_offhours_candidates", "ec2_ops_offhours_candidates"])
+    st.subheader("Efficiency Opportunities", divider=False)
+
+    v = pick_view(["ec2_ops_offhours_candidates"])
     if v:
         q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY est_monthly_savings_usd DESC NULLS LAST"
-        _show_q(q, title="Off-hours Candidates")
+        _show_q(q, title="Schedule Off-Hours")
 
-    # Spot candidates (workloads eligible to move to Spot)
-    v = pick_view(["ec2_od_spot_candidates", "ec2_ops_spot_candidates"])
+    v = pick_view(["ec2_ops_spot_candidates"])
     if v:
         q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY est_monthly_savings_usd DESC NULLS LAST"
-        _show_q(q, title="Spot Candidates")
+        _show_q(q, title="Move to Spot")
 
-    # Rightsize candidates (next smaller)
-    v = pick_view(["ec2_od_rightsize_candidates", "ec2_ops_rightsize_candidates"])
+    v = pick_view(["ec2_ops_rightsize_down", "ec2_ops_rightsize_candidates"])
     if v:
         q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY est_monthly_savings_usd DESC NULLS LAST"
-        _show_q(q, title="Rightsize Candidates")
+        _show_q(q, title="Rightsize Down")
 
-# 3) Utilization
+# 3) UTILIZATION
 with tabC:
     c1, c2 = st.columns(2)
-    with c1:
-        v = pick_view(["ec2_od_low_utilization", "ec2_ops_low_utilization"])
-        if v:
-            q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY COALESCE(cost_usd, total_cost) DESC"
-            _show_q(q, title="Low Utilization")
-    with c2:
-        v = pick_view(["ec2_od_high_utilization", "ec2_ops_high_utilization"])
-        if v:
-            q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY COALESCE(cost_usd, total_cost) DESC"
-            _show_q(q, title="High Utilization")
-
-# 4) Recommended Actions (ranked)
-with tabD:
-    v = pick_view(["ec2_od_actions_ranked", "ec2_ops_actions_ranked"])
+    v = pick_view(["ec2_ops_low_utilization"])
     if v:
-        q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY est_monthly_savings_usd DESC NULLS LAST, COALESCE(cost_usd, total_cost) DESC NULLS LAST"
-        _show_q(q, title="Recommended Actions (ranked)")
+        q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY {metric_cost} DESC NULLS LAST"
+        _show_q(q, title="Low Utilization")
+    with c2:
+        v2 = pick_view(["ec2_ops_high_utilization"])
+        if v2:
+            q2 = f"SELECT * FROM {v2} WHERE {ec2_where_for_view(v2)} ORDER BY {metric_cost} DESC NULLS LAST"
+            _show_q(q2, title="High Utilization")
+
+# 4) RECOMMENDED ACTIONS
+with tabD:
+    v = pick_view(["ec2_ops_actions_ranked"])
+    if v:
+        q = f"""
+        SELECT *
+        FROM {v}
+        WHERE {ec2_where_for_view(v)}
+        ORDER BY est_delta_usd DESC NULLS LAST, {metric_cost} DESC NULLS LAST
+        LIMIT 2000
+        """
+        _show_q(q.strip(), title="Recommended Actions (ranked)")
     else:
-        st.info("Action ranking view not found. If you want this tab, create a view named `ec2_od_actions_ranked`.")
-
-
-
-
-CREATE OR REPLACE VIEW ec2_od_by_ba_region AS
-SELECT
-  business_area,
-  region,
-  COUNT(*) AS instance_count,
-  SUM(COALESCE(cost_usd, total_cost)) AS total_cost_usd
-FROM ec2_od_norm
-GROUP BY business_area, region;
+        st.info("Action ranking view not found.")
