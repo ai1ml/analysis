@@ -180,3 +180,15 @@ with tabD:
         _show_q(q, title="Recommended Actions (ranked)")
     else:
         st.info("Action ranking view not found. If you want this tab, create a view named `ec2_od_actions_ranked`.")
+
+
+
+
+CREATE OR REPLACE VIEW ec2_od_by_ba_region AS
+SELECT
+  business_area,
+  region,
+  COUNT(*) AS instance_count,
+  SUM(COALESCE(cost_usd, total_cost)) AS total_cost_usd
+FROM ec2_od_norm
+GROUP BY business_area, region;
