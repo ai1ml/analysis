@@ -1,0 +1,248 @@
+# =========================
+# EC2 On-Demand Analysis (ops)
+# =========================
+import streamlit as st
+
+st.markdown("## EC2 — On-Demand Analysis")
+
+# --- helpers (same pattern as EBS/RDS) ---
+def _ec2_q(x: str) -> str:
+    return str(x).replace("'", "''")
+
+def _ec2_distinct(col: str, src: str = "ec2_od_norm"):
+    try:
+        rows = con.execute(
+            f"SELECT DISTINCT {col} FROM {src} WHERE {col} IS NOT NULL ORDER BY 1"
+        ).fetchall()
+        return [r[0] for r in rows if r and r[0] is not None]
+    except Exception:
+        return []
+
+def ec2_where_for_view(view_name: str, base: str = "1=1") -> str:
+    """
+    Build a WHERE clause using ONLY columns the target view actually has.
+    Mirrors your EBS-style builder.
+    """
+    cols = set(con.execute(f"SELECT * FROM {view_name} LIMIT 0").fetchdf().columns)
+    wc = [base]
+
+    # Business Area
+    if "business_area" in cols and sel_ba != "(all)":
+        wc.append(f"business_area = '{_ec2_q(sel_ba)}'")
+
+    # Region
+    if "region" in cols and sel_region != "(all)":
+        wc.append(f"region = '{_ec2_q(sel_region)}'")
+
+    # Platform (Linux/Windows etc). Prefer a normalized column if present.
+    if sel_platforms and len(sel_platforms) != len(platform_opts):
+        p_list = ", ".join([f"'{_ec2_q(p)}'" for p in sel_platforms])
+        if "platform_norm" in cols:
+            wc.append(f"platform_norm IN ({p_list})")
+        elif "platform" in cols:
+            wc.append(f"platform IN ({p_list})")
+
+    # Instance family (m5, c5, r5…). Prefer explicit column if available; else derive from instance_type.
+    if sel_fams and len(sel_fams) != len(fam_opts):
+        f_list = ", ".join([f"'{_ec2_q(f)}'" for f in sel_fams])
+        if "family" in cols:
+            wc.append(f"family IN ({f_list})")
+        elif "instance_type" in cols:
+            # family = left part before the dot (e.g., m5 in m5.large)
+            wc.append(f"REGEXP_EXTRACT(instance_type, '^([a-z0-9]+)\\..+$', 1) IN ({f_list})")
+
+    # CPU range: support either avg_cpu_14d or avg_cpu if present
+    if "avg_cpu_14d" in cols:
+        wc.append(f"avg_cpu_14d BETWEEN {int(cpu_low)} AND {int(cpu_high)}")
+    elif "avg_cpu" in cols:
+        wc.append(f"avg_cpu BETWEEN {int(cpu_low)} AND {int(cpu_high)}")
+
+    # Hours range (monthly runtime)
+    if "hours" in cols:
+        wc.append(f"hours BETWEEN {int(hours_low)} AND {int(hours_high)}")
+
+    # Min monthly cost: support both cost_usd, monthly_cost_usd, total_cost_usd
+    if "cost_usd" in cols:
+        wc.append(f"cost_usd >= {float(min_cost)}")
+    elif "monthly_cost_usd" in cols:
+        wc.append(f"monthly_cost_usd >= {float(min_cost)}")
+    elif "total_cost_usd" in cols:
+        wc.append(f"total_cost_usd >= {float(min_cost)}")
+
+    # Account search
+    if acct_query and "account_id" in cols:
+        wc.append(f"CAST(account_id AS VARCHAR) ILIKE '%{_ec2_q(acct_query)}%'")
+
+    return " AND ".join(wc)
+
+
+# --- sidebar filters (same UX/order as EBS) ---
+ba_opts      = ["(all)"] + _ec2_distinct("business_area", "ec2_od_norm")
+region_opts  = ["(all)"] + _ec2_distinct("region", "ec2_od_norm")
+
+# Prefer normalized platform if your pipeline created it; else raw platform
+platform_opts = _ec2_distinct("platform_norm", "ec2_od_norm")
+if not platform_opts:
+    platform_opts = _ec2_distinct("platform", "ec2_od_norm")
+
+# Families from a view/table if you materialized it; else derive from instance_type
+fam_opts = _ec2_distinct("family", "ec2_od_norm")
+if not fam_opts:
+    try:
+        fam_opts = sorted(set([
+            r[0] for r in con.execute("""
+                SELECT DISTINCT REGEXP_EXTRACT(instance_type, '^([a-z0-9]+)\\..+$', 1) AS fam
+                FROM ec2_od_norm WHERE instance_type IS NOT NULL
+            """).fetchall() if r and r[0]
+        ]))
+    except Exception:
+        fam_opts = []
+
+# Dynamic ranges
+_max_cpu   = int(con.execute("SELECT COALESCE(CEIL(MAX(COALESCE(avg_cpu_14d, avg_cpu))),100) FROM ec2_od_norm").fetchone()[0] or 100)
+_max_hours = int(con.execute("SELECT COALESCE(CEIL(MAX(hours)),0) FROM ec2_od_norm").fetchone()[0] or 0)
+_max_cost  = float(con.execute("""
+    SELECT COALESCE(MAX(COALESCE(cost_usd, monthly_cost_usd, total_cost_usd)), 0)
+    FROM ec2_od_norm
+""").fetchone()[0] or 0.0)
+
+st.sidebar.subheader("Filters — EC2 (On-Demand)")
+sel_ba       = st.sidebar.selectbox("Business Area", ba_opts, index=0, key="ec2_ba")
+sel_region   = st.sidebar.selectbox("Region",        region_opts, index=0, key="ec2_region")
+sel_platforms= st.sidebar.multiselect("Platform",    platform_opts, default=platform_opts, key="ec2_platforms")
+sel_fams     = st.sidebar.multiselect("Instance Family", fam_opts, default=fam_opts, key="ec2_families")
+
+cpu_low, cpu_high = st.sidebar.slider(
+    "CPU (avg 14d, %)", 0, 100, (0, min(100, _max_cpu)), key="ec2_cpu"
+)
+hours_low, hours_high = st.sidebar.slider(
+    "Hours in month", 0, max(720, _max_hours), (0, max(720, _max_hours)), key="ec2_hours"
+)
+min_cost = st.sidebar.slider(
+    "Min monthly cost (USD)",
+    0.0, float(max(1000.0, _max_cost)), 0.0, step=5.0, key="ec2_min_cost"
+)
+acct_query = st.sidebar.text_input("Account ID contains (optional)", value="", key="ec2_acct_search")
+
+
+# --- metrics strip (mirrors EBS style) ---
+where_norm = ec2_where_for_view("ec2_od_norm")
+m = con.execute(f"""
+    SELECT
+      COUNT(*) AS instances,
+      SUM(COALESCE(cost_usd, monthly_cost_usd, total_cost_usd)) AS total_cost_usd,
+      SUM(CASE WHEN hours >= 24*28 THEN 1 ELSE 0 END) AS approx_24x7
+    FROM ec2_od_norm
+    WHERE {where_norm}
+""").fetchone()
+mc1, mc2, mc3 = st.columns(3)
+mc1.metric("Instances (filtered)", int(m[0] or 0))
+mc2.metric("Total On-Demand $/mo", f"${(m[1] or 0):,.2f}")
+mc3.metric("~24×7 Count",          int(m[2] or 0))
+
+# --- TABS (like EBS): Overview / Savings / Utilization / Actions ---
+tabA, tabB, tabC, tabD = st.tabs([
+    "Overview", "Savings Opportunities", "Utilization", "Recommended Actions"
+])
+
+def _show_q(q: str):
+    st.caption(q)
+    st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
+
+# 1) OVERVIEW
+with tabA:
+    st.subheader("Overview")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        # rollup by BA × Region × Platform
+        v = "ec2_od_by_ba_region_platform"
+        q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY total_cost_usd DESC"
+        st.caption("By BA × Region × Platform")
+        _show_q(q)
+
+    with c2:
+        # rollup by family × platform
+        v = "ec2_od_by_family_platform"
+        q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY total_cost_usd DESC"
+        st.caption("By Instance Family × Platform")
+        _show_q(q)
+
+# 2) SAVINGS OPPORTUNITIES
+with tabB:
+    st.subheader("Savings Opportunities")
+
+    with st.expander("Move to Spot (steady or interruption-tolerant)", expanded=True):
+        v = "ec2_ops_spot_candidates"
+        q = f"""
+        SELECT *
+        FROM {v}
+        WHERE {ec2_where_for_view(v)}
+        ORDER BY est_monthly_savings_usd DESC NULLS LAST, total_cost_usd DESC NULLS LAST
+        LIMIT 1000
+        """
+        _show_q(q.strip())
+
+    with st.expander("Schedule Off-Hours (non-prod, ~24×7)", expanded=True):
+        v = "ec2_ops_offhours_candidates"
+        q = f"""
+        SELECT *
+        FROM {v}
+        WHERE {ec2_where_for_view(v)}
+        ORDER BY est_monthly_savings_usd DESC NULLS LAST, total_cost_usd DESC NULLS LAST
+        LIMIT 1000
+        """
+        _show_q(q.strip())
+
+    with st.expander("Rightsize Down (under-utilized)", expanded=False):
+        v = "ec2_ops_rightsize_down"
+        q = f"""
+        SELECT *
+        FROM {v}
+        WHERE {ec2_where_for_view(v)}
+        ORDER BY est_monthly_savings_usd DESC NULLS LAST, total_cost_usd DESC NULLS LAST
+        LIMIT 1000
+        """
+        _show_q(q.strip())
+
+# 3) UTILIZATION (hot/cold)
+with tabC:
+    st.subheader("Utilization")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        v = "ec2_ops_high_utilization"
+        q = f"""
+        SELECT *
+        FROM {v}
+        WHERE {ec2_where_for_view(v)}
+        ORDER BY avg_cpu_14d DESC NULLS LAST, COALESCE(cost_usd, monthly_cost_usd, total_cost_usd) DESC NULLS LAST
+        LIMIT 1000
+        """
+        st.caption("Hot Instances (CPU ≥ 90%)")
+        _show_q(q.strip())
+
+    with c2:
+        v = "ec2_ops_low_utilization"
+        q = f"""
+        SELECT *
+        FROM {v}
+        WHERE {ec2_where_for_view(v)}
+        ORDER BY COALESCE(cost_usd, monthly_cost_usd, total_cost_usd) DESC NULLS LAST, avg_cpu_14d ASC NULLS LAST
+        LIMIT 1000
+        """
+        st.caption("Cold Instances (CPU < 5%)")
+        _show_q(q.strip())
+
+# 4) RECOMMENDED ACTIONS (ranked)
+with tabD:
+    st.subheader("Recommended Actions (ranked)")
+    v = "ec2_ops_actions_ranked"
+    q = f"""
+    SELECT *
+    FROM {v}
+    WHERE {ec2_where_for_view(v)}
+    ORDER BY priority DESC, est_delta_usd DESC NULLS LAST, COALESCE(cost_usd, monthly_cost_usd, total_cost_usd) DESC NULLS LAST
+    LIMIT 2000
+    """
+    _show_q(q.strip())
