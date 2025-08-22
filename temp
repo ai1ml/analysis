@@ -1,40 +1,39 @@
+# --- metrics strip (mirrors EBS style) — SNAPSHOTS ---
+# base table/view: snapshots_parsed
+snap_base = "snapshots_parsed"
+snap_where = snap_where_for_view(snap_base)  # your existing builder
+
+m = con.execute(f"""
+    SELECT
+      COUNT(DISTINCT snapshot_id)                          AS snaps,
+      SUM(COALESCE(public_cost_usd, total_cost_usd, 0.0)) AS total_cost_usd
+    FROM {snap_base}
+    WHERE {snap_where}
+""").fetchone()
+
+# Optional: archive savings (if you have snapshots_archive_opportunity)
+archive_view_exists = False
+try:
+    con.execute("SELECT * FROM snapshots_archive_opportunity LIMIT 0")
+    archive_view_exists = True
+except Exception:
+    pass
+
+arch = (0.0,)
+if archive_view_exists:
+    arch = con.execute(f"""
+        SELECT
+          SUM(COALESCE(est_monthly_savings_usd, 0.0)) AS archive_savings_usd
+        FROM snapshots_archive_opportunity
+        WHERE {snap_where_for_view('snapshots_archive_opportunity')}
+    """).fetchone()
+
+mc1, mc2, mc3 = st.columns(3)
+mc1.metric("Snapshots (filtered)", int(m[0] or 0))
+mc2.metric("Total $/mo",            f"${(m[1] or 0):,.2f}")
+mc3.metric("Archive opp. $/mo",     f"${(arch[0] or 0):,.2f}" if archive_view_exists else "—")
+
+# --- TABS (like EBS): Overview / Savings / Utilization / Actions ---
 tabA, tabB, tabC, tabD = st.tabs([
-    "Overview", "Efficiency Opportunities", "TA Comparison", "Recommended Actions"
+    "Overview", "Savings Opportunities", "Utilization", "Recommended Actions"
 ])
-
-# ===== 1) OVERVIEW =====
-with tabA:
-    v = "ec2_ops_ba_summary"
-    q = f"""
-    SELECT *
-    FROM {v}
-    WHERE {ec2_where_for_view(v)}
-    ORDER BY ondemand_cost_usd DESC NULLS LAST
-    """
-    _df(q, title="BA Summary (OnDemand vs Spot vs Savings Potential)")
-
-# ===== 2) EFFICIENCY OPPORTUNITIES =====
-with tabB:
-    v = "ec2_spot_candidates"
-    q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY est_monthly_savings_usd DESC NULLS LAST"
-    _df(q, title="OnDemand → Spot Candidates")
-
-    v = "ec2_schedule_candidates"
-    q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY est_monthly_savings_usd DESC NULLS LAST"
-    _df(q, title="Schedule (Off-Hours) Candidates")
-
-    v = "ec2_rightsize_candidates"
-    q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY est_monthly_savings_usd DESC NULLS LAST"
-    _df(q, title="Rightsize (CPU <30%) Candidates")
-
-# ===== 3) TA COMPARISON =====
-with tabC:
-    v = "ec2_ta_rightsize_comparison"
-    q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY ours_est_monthly_savings_usd DESC NULLS LAST"
-    _df(q, title="Rightsize: Ours vs Trusted Advisor")
-
-# ===== 4) RECOMMENDED ACTIONS =====
-with tabD:
-    v = "ec2_ops_actions_ranked"
-    q = f"SELECT * FROM {v} WHERE {ec2_where_for_view(v)} ORDER BY est_monthly_savings_usd DESC NULLS LAST"
-    _df(q, title="Recommended Actions (Ranked)")
