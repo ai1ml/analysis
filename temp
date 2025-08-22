@@ -37,3 +37,68 @@ mc3.metric("Archive opp. $/mo",     f"${(arch[0] or 0):,.2f}" if archive_view_ex
 tabA, tabB, tabC, tabD = st.tabs([
     "Overview", "Savings Opportunities", "Utilization", "Recommended Actions"
 ])
+
+
+# --- metrics strip (mirrors EBS style) — EC2 Reserved (RI / TA) ---
+# pick base table/view
+def _exists(name: str) -> bool:
+    try:
+        con.execute(f"SELECT * FROM {name} LIMIT 0")
+        return True
+    except Exception:
+        return False
+
+ta_base = "ec2_ta_norm" if _exists("ec2_ta_norm") else ("ec2_ta" if _exists("ec2_ta") else None)
+
+if ta_base is None:
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric("TA rows (filtered)", "—")
+    mc2.metric("Recs to purchase",   "—")
+    mc3.metric("Est. savings $/mo",  "—")
+else:
+    where_ta = ec2_ta_where_for_view(ta_base)  # your existing builder
+
+    # figure out column names present in your sheet
+    ta_cols = set(con.execute(f"SELECT * FROM {ta_base} LIMIT 0").fetchdf().columns)
+
+    purch_col = next((c for c in [
+        "number_of_instances_to_purchase",
+        "numberofinstancestopurchase",
+        "instances_to_purchase",
+        "recommended_number_of_instances"
+    ] if c in ta_cols), None)
+
+    save_col = next((c for c in [
+        "existing_saving_usd",
+        "existing_saving",
+        "estimated_monthly_savings_usd",
+        "rightsize_monthly_cost_avoidance",
+        "rightsizemonthlycostavoidance",
+        "ta_rightsize_savings_usd"
+    ] if c in ta_cols), None)
+
+    # rows count
+    r = con.execute(f"SELECT COUNT(*) FROM {ta_base} WHERE {where_ta}").fetchone()
+    rows_cnt = int(r[0] or 0)
+
+    # instances to purchase
+    rec_cnt = 0
+    if purch_col:
+        rec = con.execute(f"SELECT SUM(COALESCE({purch_col},0)) FROM {ta_base} WHERE {where_ta}").fetchone()
+        rec_cnt = int(rec[0] or 0)
+
+    # estimated savings
+    est_usd = 0.0
+    if save_col:
+        sv = con.execute(f"SELECT SUM(COALESCE({save_col},0.0)) FROM {ta_base} WHERE {where_ta}").fetchone()
+        est_usd = float(sv[0] or 0.0)
+
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric("TA rows (filtered)", f"{rows_cnt:,}")
+    mc2.metric("Recs to purchase",   f"{rec_cnt:,}" if purch_col else "—")
+    mc3.metric("Est. savings $/mo",  f"${est_usd:,.2f}" if save_col else "—")
+
+# --- TABS (like EBS): Overview / Savings / Utilization / Actions ---
+tabA, tabB, tabC, tabD = st.tabs([
+    "Overview", "Savings Opportunities", "Utilization", "Recommended Actions"
+])
