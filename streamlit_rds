@@ -1,0 +1,188 @@
+# =========================
+# RDS Analysis (EBS-style)
+# =========================
+import streamlit as st
+
+st.markdown("## RDS Analysis")
+
+# ---- small helpers (UI only) ----
+def _exists(obj: str) -> bool:
+    try:
+        con.execute(f"SELECT * FROM {obj} LIMIT 0")
+        return True
+    except Exception:
+        return False
+
+def _first_col(view: str, candidates: list[str]) -> str | None:
+    try:
+        cols = set(con.execute(f"SELECT * FROM {view} LIMIT 0").fetchdf().columns)
+        return next((c for c in candidates if c in cols), None)
+    except Exception:
+        return None
+
+def _distinct(view: str, col: str) -> list[str]:
+    try:
+        rows = con.execute(f"SELECT DISTINCT {col} AS v FROM {view} WHERE {col} IS NOT NULL ORDER BY 1").fetchall()
+        return [r[0] for r in rows if r[0] is not None]
+    except Exception:
+        return []
+
+def get_rds_ba_options() -> list[str]:
+    for src in ["rds_usage", "rds_by_ba_region", "rds_actions_ranked"]:
+        if _exists(src):
+            c = _first_col(src, ["BA", "business_area"])
+            if c:
+                vals = _distinct(src, c)
+                if vals: return vals
+    return []
+
+def get_rds_region_options() -> list[str]:
+    for src in ["rds_usage", "rds_by_ba_region", "rds_actions_ranked"]:
+        if _exists(src) and _first_col(src, ["region"]):
+            return _distinct(src, "region")
+    return []
+
+def _show_q(q: str):
+    st.caption(q)
+    st.dataframe(con.execute(q).fetchdf(), hide_index=True, use_container_width=True)
+
+# ---- one-time seed prices from CSV (per session) ----
+if "rds_prices_seeded" not in st.session_state:
+    try:
+        seed_price_from_observed(con)   # fills price_rds from your CSV (observed)
+        st.session_state["rds_prices_seeded"] = True
+    except Exception as e:
+        st.warning(f"Price seed from observed data skipped: {e}")
+
+# ---- sidebar: filters (match EBS style) ----
+st.sidebar.subheader("Filters — RDS")
+
+# Options
+rds_ba_options     = get_rds_ba_options()
+rds_region_options = get_rds_region_options()
+
+# Widgets (values go to session_state keys used by rds_where_for_view)
+st.sidebar.selectbox("Business Area", ["(all)"] + rds_ba_options, index=0, key="rds_ba")
+st.sidebar.selectbox("Region", ["(all)"] + rds_region_options, index=0, key="rds_region")
+
+# Data-driven maxes (optional; safe fallbacks)
+try:
+    data_max_hours = con.execute("SELECT COALESCE(MAX(hours), MAX(usage_quantity_hours), 0) FROM rds_usage").fetchone()[0] or 0
+except Exception:
+    data_max_hours = 720
+try:
+    data_max_cost = con.execute("SELECT COALESCE(MAX(cost_usd), MAX(current_cost_usd), MAX(monthly_cost_usd), 0) FROM rds_usage").fetchone()[0] or 0.0
+except Exception:
+    data_max_cost = 0.0
+
+st.sidebar.slider("CPU (avg 14d, %)", 0, 100, value=(0, 100), key="rds_cpu")
+st.sidebar.slider("Hours in month", 0, max(720, int(data_max_hours)), value=(0, max(720, int(min(data_max_hours, 720)))), key="rds_hours")
+st.sidebar.slider("Min monthly cost (USD)", 0.0, float(max(1000.0, data_max_cost)), value=0.0, step=5.0, key="rds_min_cost")
+st.sidebar.text_input("Linked Account contains (optional)", value="", key="rds_acct_search")
+
+# ---- price refresh (API) ----
+col_btn, col_last = st.columns([1.2, 3])
+with col_btn:
+    if st.button("🔄 Update Prices (API)", use_container_width=True):
+        if "refresh_rds_prices_from_aws" in globals():
+            try:
+                n = refresh_rds_prices_from_aws()  # your API updater
+                st.success(f"Pricing refreshed from AWS ({int(n or 0)} rows).")
+            except Exception as e:
+                st.error(f"Pricing update failed: {e}")
+        else:
+            st.warning("API updater not wired yet (refresh_rds_prices_from_aws not found).")
+
+# ---- KPI strip (mirrors EBS style) ----
+where_norm = rds_where_for_view("rds_usage")
+m = con.execute(f"""
+    SELECT
+      COUNT(*) AS dbs,
+      SUM(COALESCE(cost_usd, current_cost_usd, monthly_cost_usd, 0)) AS total_cost_usd,
+      SUM(CASE WHEN avg_cpu_14d IS NOT NULL AND avg_cpu_14d < 10 THEN 1 ELSE 0 END) AS under_10pct_cpu
+    FROM rds_usage
+    WHERE {where_norm}
+""").fetchone()
+kc1, kc2, kc3 = st.columns(3)
+kc1.metric("DB instances (filtered)", int(m[0] or 0))
+kc2.metric("Total RDS $/mo",         f"${(m[1] or 0):,.2f}")
+kc3.metric("CPU < 10% (count)",      int(m[2] or 0))
+
+st.divider()
+
+# ---- TABS (like EBS): Overview / Rightsize / Off-hours / Actions ----
+tabR1, tabR2, tabR3, tabR4 = st.tabs([
+    "Overview", "Rightsizing", "Off-hours", "Recommended Actions"
+])
+
+# 1) OVERVIEW
+with tabR1:
+    st.subheader("Overview")
+    c1, c2 = st.columns(2)
+
+    # BA × Region roll-up (if exists)
+    if _exists("rds_by_ba_region"):
+        v = "rds_by_ba_region"
+        q = f"SELECT * FROM {v} WHERE {rds_where_for_view(v)} ORDER BY total_cost_usd DESC NULLS LAST"
+        st.caption("By BA × Region")
+        _show_q(q)
+    else:
+        st.info("View rds_by_ba_region not found.")
+
+    # (Optional) High utilization summary, if you created it
+    if _exists("rds_high_utilization"):
+        v = "rds_high_utilization"
+        q = f"SELECT * FROM {v} WHERE {rds_where_for_view(v)} ORDER BY avg_cpu_14d DESC NULLS LAST, current_cost_usd DESC NULLS LAST"
+        st.caption("High utilization (scale-up candidates)")
+        _show_q(q)
+
+# 2) RIGHTSIZE (next smaller)
+with tabR2:
+    st.subheader("Rightsizing — Next Smaller")
+    if _exists("rds_rightsize_next_smaller"):
+        v = "rds_rightsize_next_smaller"
+        q = f"""
+        SELECT billing_period, account_name, BA, db_id, region, current_class, recommended_class,
+               current_cost_usd, est_monthly_savings_usd, avg_cpu_14d, price_date
+        FROM {v}
+        WHERE {rds_where_for_view(v)}
+        ORDER BY est_monthly_savings_usd DESC NULLS LAST
+        LIMIT 500
+        """
+        _show_q(q.strip())
+    else:
+        st.info("View rds_rightsize_next_smaller not found.")
+
+# 3) OFF-HOURS (non-prod 24×7 → 5×12)
+with tabR3:
+    st.subheader("Off-hours Candidates")
+    if _exists("rds_offhours_candidates"):
+        v = "rds_offhours_candidates"
+        q = f"""
+        SELECT billing_period, account_name, BA, db_id, region, instance_class,
+               current_hours, current_cost_usd, approx_247, est_monthly_savings_usd, avg_cpu_14d
+        FROM {v}
+        WHERE {rds_where_for_view(v)}
+        ORDER BY est_monthly_savings_usd DESC NULLS LAST
+        LIMIT 500
+        """
+        _show_q(q.strip())
+    else:
+        st.info("View rds_offhours_candidates not found.")
+
+# 4) ACTIONS (ranked; deduped)
+with tabR4:
+    st.subheader("Recommended Actions (ranked)")
+    if _exists("rds_actions_ranked"):
+        v = "rds_actions_ranked"
+        q = f"""
+        SELECT action, service, resource_id, account_name, BA, region, current_config,
+               current_cost_usd, est_monthly_savings_usd, reason, assumptions, confidence
+        FROM {v}
+        WHERE {rds_where_for_view(v)}
+        ORDER BY est_monthly_savings_usd DESC NULLS LAST, current_cost_usd DESC NULLS LAST
+        LIMIT 500
+        """
+        _show_q(q.strip())
+    else:
+        st.info("View rds_actions_ranked not found.")
